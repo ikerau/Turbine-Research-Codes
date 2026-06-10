@@ -59,15 +59,9 @@ TURB_MAP =  EngineHPTMap
 # ══════════════════════════════════════════════════════════════════════════════
 
 class Turbojet(pyc.Cycle):
-    """
-    Single-spool turbojet design point.
-    Balances: W → Fn_target, FAR → T4_target, turb_PR → shaft pwr = 0
-    """
-
     def setup(self):
         self.options['thermo_method'] = 'TABULAR'
         self.options['thermo_data']   = pyc.AIR_JETA_TAB_SPEC
-        FUEL_TYPE = 'FAR'
         design = self.options['design']
 
         self.add_subsystem('fc',     pyc.FlightConditions())
@@ -75,8 +69,10 @@ class Turbojet(pyc.Cycle):
         self.add_subsystem('comp',   pyc.Compressor(map_data=COMP_MAP,
                                                      map_extrap=True),
                                      promotes_inputs=['Nmech'])
-        self.add_subsystem('burner', pyc.Combustor(fuel_type=FUEL_TYPE))
+        self.add_subsystem('bld3',   pyc.BleedOut(bleed_names=['hpt_cool']))  # ← extract here
+        self.add_subsystem('burner', pyc.Combustor(fuel_type='FAR'))
         self.add_subsystem('turb',   pyc.Turbine(map_data=TURB_MAP,
+                                                  bleed_names=['hpt_cool'],   # ← receive here
                                                   map_extrap=True),
                                      promotes_inputs=['Nmech'])
         self.add_subsystem('nozz',   pyc.Nozzle(nozzType='CD', lossCoef='Cv'))
@@ -85,12 +81,16 @@ class Turbojet(pyc.Cycle):
         self.add_subsystem('perf',   pyc.Performance(num_nozzles=1,
                                                       num_burners=1))
 
-        self.pyc_connect_flow('fc.Fl_O',     'inlet.Fl_I',  connect_w=False)
-        self.pyc_connect_flow('inlet.Fl_O',  'comp.Fl_I')
-        self.pyc_connect_flow('comp.Fl_O',   'burner.Fl_I')
-        self.pyc_connect_flow('burner.Fl_O', 'turb.Fl_I')
-        self.pyc_connect_flow('turb.Fl_O',   'nozz.Fl_I')
+        # ── Flow connections ──────────────────────────────────────────────
+        self.pyc_connect_flow('fc.Fl_O',      'inlet.Fl_I',  connect_w=False)
+        self.pyc_connect_flow('inlet.Fl_O',   'comp.Fl_I')
+        self.pyc_connect_flow('comp.Fl_O',    'bld3.Fl_I')   # ← comp → bld3
+        self.pyc_connect_flow('bld3.Fl_O',    'burner.Fl_I') # ← bld3 → burner
+        self.pyc_connect_flow('burner.Fl_O',  'turb.Fl_I')
+        self.pyc_connect_flow('bld3.hpt_cool','turb.hpt_cool') # ← cooling flow
+        self.pyc_connect_flow('turb.Fl_O',    'nozz.Fl_I')
 
+        # ── Shaft and performance connections (unchanged) ─────────────────
         self.connect('comp.trq',         'shaft.trq_0')
         self.connect('turb.trq',         'shaft.trq_1')
         self.connect('fc.Fl_O:stat:P',   'nozz.Ps_exhaust')
@@ -100,8 +100,8 @@ class Turbojet(pyc.Cycle):
         self.connect('inlet.F_ram',      'perf.ram_drag')
         self.connect('nozz.Fg',          'perf.Fg_0')
 
+        # ── Balances (unchanged) ──────────────────────────────────────────
         balance = self.add_subsystem('balance', om.BalanceComp())
-
         if design:
             balance.add_balance('W', units='lbm/s', eq_units='lbf',
                                  rhs_name='Fn_target')
@@ -119,12 +119,12 @@ class Turbojet(pyc.Cycle):
             self.connect('shaft.pwr_net',   'balance.lhs:turb_PR')
 
         newton = self.nonlinear_solver = om.NewtonSolver()
-        newton.options['atol']                        = 1e-6
-        newton.options['rtol']                        = 1e-6
-        newton.options['iprint']                      = 2
-        newton.options['maxiter']                     = 15
-        newton.options['solve_subsystems']            = True
-        newton.options['max_sub_solves']              = 100
+        newton.options['atol']             = 1e-6
+        newton.options['rtol']             = 1e-6
+        newton.options['iprint']           = 2
+        newton.options['maxiter']          = 15
+        newton.options['solve_subsystems'] = True
+        newton.options['max_sub_solves']   = 100
         newton.options['reraise_child_analysiserror'] = False
         self.linear_solver = om.DirectSolver()
         super().setup()
@@ -154,8 +154,10 @@ class TurbojetConstTt4(pyc.Cycle):
         self.add_subsystem('comp',   pyc.Compressor(map_data=COMP_MAP,
                                                      map_extrap=True),
                                      promotes_inputs=['Nmech'])
-        self.add_subsystem('burner', pyc.Combustor(fuel_type=FUEL_TYPE))
+        self.add_subsystem('bld3',   pyc.BleedOut(bleed_names=['hpt_cool']))  # ← extract here
+        self.add_subsystem('burner', pyc.Combustor(fuel_type='FAR'))
         self.add_subsystem('turb',   pyc.Turbine(map_data=TURB_MAP,
+                                                  bleed_names=['hpt_cool'],   # ← receive here
                                                   map_extrap=True),
                                      promotes_inputs=['Nmech'])
         self.add_subsystem('nozz',   pyc.Nozzle(nozzType='CD', lossCoef='Cv'))
@@ -164,11 +166,14 @@ class TurbojetConstTt4(pyc.Cycle):
         self.add_subsystem('perf',   pyc.Performance(num_nozzles=1,
                                                       num_burners=1))
 
-        self.pyc_connect_flow('fc.Fl_O',     'inlet.Fl_I',  connect_w=False)
-        self.pyc_connect_flow('inlet.Fl_O',  'comp.Fl_I')
-        self.pyc_connect_flow('comp.Fl_O',   'burner.Fl_I')
-        self.pyc_connect_flow('burner.Fl_O', 'turb.Fl_I')
-        self.pyc_connect_flow('turb.Fl_O',   'nozz.Fl_I')
+        # ── Flow connections ──────────────────────────────────────────────
+        self.pyc_connect_flow('fc.Fl_O',      'inlet.Fl_I',  connect_w=False)
+        self.pyc_connect_flow('inlet.Fl_O',   'comp.Fl_I')
+        self.pyc_connect_flow('comp.Fl_O',    'bld3.Fl_I')   # ← comp → bld3
+        self.pyc_connect_flow('bld3.Fl_O',    'burner.Fl_I') # ← bld3 → burner
+        self.pyc_connect_flow('burner.Fl_O',  'turb.Fl_I')
+        self.pyc_connect_flow('bld3.hpt_cool','turb.hpt_cool') # ← cooling flow
+        self.pyc_connect_flow('turb.Fl_O',    'nozz.Fl_I')
 
         self.connect('comp.trq',         'shaft.trq_0')
         self.connect('turb.trq',         'shaft.trq_1')
@@ -236,8 +241,10 @@ class TurbojetConstFn(pyc.Cycle):
         self.add_subsystem('comp',   pyc.Compressor(map_data=COMP_MAP,
                                                      map_extrap=True),
                                      promotes_inputs=['Nmech'])
-        self.add_subsystem('burner', pyc.Combustor(fuel_type=FUEL_TYPE))
+        self.add_subsystem('bld3',   pyc.BleedOut(bleed_names=['hpt_cool']))  # ← extract here
+        self.add_subsystem('burner', pyc.Combustor(fuel_type='FAR'))
         self.add_subsystem('turb',   pyc.Turbine(map_data=TURB_MAP,
+                                                  bleed_names=['hpt_cool'],   # ← receive here
                                                   map_extrap=True),
                                      promotes_inputs=['Nmech'])
         self.add_subsystem('nozz',   pyc.Nozzle(nozzType='CD', lossCoef='Cv'))
@@ -246,11 +253,14 @@ class TurbojetConstFn(pyc.Cycle):
         self.add_subsystem('perf',   pyc.Performance(num_nozzles=1,
                                                       num_burners=1))
 
-        self.pyc_connect_flow('fc.Fl_O',     'inlet.Fl_I',  connect_w=False)
-        self.pyc_connect_flow('inlet.Fl_O',  'comp.Fl_I')
-        self.pyc_connect_flow('comp.Fl_O',   'burner.Fl_I')
-        self.pyc_connect_flow('burner.Fl_O', 'turb.Fl_I')
-        self.pyc_connect_flow('turb.Fl_O',   'nozz.Fl_I')
+        # ── Flow connections ──────────────────────────────────────────────
+        self.pyc_connect_flow('fc.Fl_O',      'inlet.Fl_I',  connect_w=False)
+        self.pyc_connect_flow('inlet.Fl_O',   'comp.Fl_I')
+        self.pyc_connect_flow('comp.Fl_O',    'bld3.Fl_I')   # ← comp → bld3
+        self.pyc_connect_flow('bld3.Fl_O',    'burner.Fl_I') # ← bld3 → burner
+        self.pyc_connect_flow('burner.Fl_O',  'turb.Fl_I')
+        self.pyc_connect_flow('bld3.hpt_cool','turb.hpt_cool') # ← cooling flow
+        self.pyc_connect_flow('turb.Fl_O',    'nozz.Fl_I')
 
         self.connect('comp.trq',         'shaft.trq_0')
         self.connect('turb.trq',         'shaft.trq_1')
@@ -306,8 +316,9 @@ class MPConstTt4(pyc.MPCycle):
         self.set_input_defaults('DESIGN.comp.MN',   0.020)
         self.set_input_defaults('DESIGN.burner.MN', 0.020)
         self.set_input_defaults('DESIGN.turb.MN',   0.4)
-        self.pyc_add_cycle_param('burner.dPqP', 0.03)
+        #self.pyc_add_cycle_param('burner.dPqP', 0.03)
         self.pyc_add_cycle_param('nozz.Cv',     0.99)
+        self.pyc_add_cycle_param('bld3.hpt_cool:frac_W', 0.10)
 
         self.a4_scalars = A4_SCALARS
         self.a4_pts     = [f'A4_{i:03d}' for i in range(len(self.a4_scalars))]
@@ -349,8 +360,9 @@ class MPConstFn(pyc.MPCycle):
         self.set_input_defaults('DESIGN.comp.MN',   0.020)
         self.set_input_defaults('DESIGN.burner.MN', 0.020)
         self.set_input_defaults('DESIGN.turb.MN',   0.4)
-        self.pyc_add_cycle_param('burner.dPqP', 0.03)
+        #self.pyc_add_cycle_param('burner.dPqP', 0.03)
         self.pyc_add_cycle_param('nozz.Cv',     0.99)
+        self.pyc_add_cycle_param('bld3.hpt_cool:frac_W', 0.10)
 
         self.fn_fractions = FN_FRACTIONS
         self.a4_scalars   = A4_SCALARS

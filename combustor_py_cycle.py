@@ -23,14 +23,8 @@ Combustor pressure drop model
     pi_b = 1 - (mdot/CdA)^2 / (2 * rho_t3 * Pt3)
   CdA back-calculated from design point at fixed reference dPqP.
 """
+
 from __future__ import annotations
-import os
-def clear_terminal():
-    if os.name == 'nt':
-        _ = os.system('cls')
-
-clear_terminal()
-
 
 import sys
 import time
@@ -51,7 +45,11 @@ import cantera as ct
 from Combustor_a4_sweep import (
     _gas, FAR_ST, FUEL, MECH, PHASE, LHV,
 )
-
+import os
+def clear_terminal():
+    if os.name == 'nt':
+        _ = os.system('cls')
+clear_terminal()
 ureg = pint.UnitRegistry()
 Q_   = ureg.Quantity
 
@@ -88,10 +86,11 @@ def lbm_s_to_kg_s(w):        return Q_(w, "lb/s").to("kg/s").magnitude
 #  CANTERA HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
 
+_GRI30 = ct.Solution("gri30.yaml")
+
 def rho_total(Tt_K, Pt_Pa):
-    g = ct.Solution("gri30.yaml")
-    g.TPX = Tt_K, Pt_Pa, "O2:0.21, N2:0.79"
-    return float(g.density)
+    _GRI30.TPX = Tt_K, Pt_Pa, "O2:0.21, N2:0.79"
+    return float(_GRI30.density)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -132,50 +131,68 @@ def extract_eta_th(prob, pt):
 #  CYCLE COMPONENTS  (parameterised by cfg)
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _make_turbojet(cfg):
-    """Return a Turbojet class using maps and settings from cfg."""
+def _make_turbojet_core(comp_map, turb_map):
+    """Return a _setup_core(self) closure with all subsystems, flow connections,
+    scalar connects, and solver config — shared by all three Cycle variants."""
+    def _setup_core(self):
+        self.options['thermo_method'] = 'TABULAR'
+        self.options['thermo_data']   = pyc.AIR_JETA_TAB_SPEC
 
-    comp_map = cfg['comp_map']
-    turb_map = cfg['turb_map']
+        self.add_subsystem('fc',     pyc.FlightConditions())
+        self.add_subsystem('inlet',  pyc.Inlet())
+        self.add_subsystem('comp',   pyc.Compressor(map_data=comp_map,
+                                                     map_extrap=True),
+                                     promotes_inputs=['Nmech'])
+        self.add_subsystem('bld3',   pyc.BleedOut(bleed_names=['ngv_cool', 'bld_cool']))
+        self.add_subsystem('burner', pyc.Combustor(fuel_type='FAR'))
+        self.add_subsystem('turb',   pyc.Turbine(map_data=turb_map,
+                                                  bleed_names=['ngv_cool', 'bld_cool'],
+                                                  map_extrap=True),
+                                     promotes_inputs=['Nmech'])
+        self.add_subsystem('nozz',   pyc.Nozzle(nozzType='CD', lossCoef='Cv'))
+        self.add_subsystem('shaft',  pyc.Shaft(num_ports=2),
+                                     promotes_inputs=['Nmech'])
+        self.add_subsystem('perf',   pyc.Performance(num_nozzles=1, num_burners=1))
+
+        self.pyc_connect_flow('fc.Fl_O',       'inlet.Fl_I',  connect_w=False)
+        self.pyc_connect_flow('inlet.Fl_O',    'comp.Fl_I')
+        self.pyc_connect_flow('comp.Fl_O',     'bld3.Fl_I')
+        self.pyc_connect_flow('bld3.Fl_O',     'burner.Fl_I')
+        self.pyc_connect_flow('burner.Fl_O',   'turb.Fl_I')
+        self.pyc_connect_flow('bld3.ngv_cool', 'turb.ngv_cool', connect_stat=False)
+        self.pyc_connect_flow('bld3.bld_cool', 'turb.bld_cool', connect_stat=False)
+        self.pyc_connect_flow('turb.Fl_O',     'nozz.Fl_I')
+
+        self.connect('comp.trq',         'shaft.trq_0')
+        self.connect('turb.trq',         'shaft.trq_1')
+        self.connect('fc.Fl_O:stat:P',   'nozz.Ps_exhaust')
+        self.connect('inlet.Fl_O:tot:P', 'perf.Pt2')
+        self.connect('comp.Fl_O:tot:P',  'perf.Pt3')
+        self.connect('burner.Wfuel',     'perf.Wfuel_0')
+        self.connect('inlet.F_ram',      'perf.ram_drag')
+        self.connect('nozz.Fg',          'perf.Fg_0')
+
+        newton = self.nonlinear_solver = om.NewtonSolver()
+        newton.options['atol']             = 1e-6
+        newton.options['rtol']             = 1e-6
+        newton.options['iprint']           = 2
+        newton.options['maxiter']          = 15
+        newton.options['solve_subsystems'] = True
+        newton.options['max_sub_solves']   = 100
+        newton.options['reraise_child_analysiserror'] = False
+        self.linear_solver = om.DirectSolver()
+
+    return _setup_core
+
+
+def _make_turbojet(cfg):
+    _core = _make_turbojet_core(cfg['comp_map'], cfg['turb_map'])
 
     class Turbojet(pyc.Cycle):
         def setup(self):
-            self.options['thermo_method'] = 'TABULAR'
-            self.options['thermo_data']   = pyc.AIR_JETA_TAB_SPEC
+            _core(self)
             design = self.options['design']
-
-            self.add_subsystem('fc',     pyc.FlightConditions())
-            self.add_subsystem('inlet',  pyc.Inlet())
-            self.add_subsystem('comp',   pyc.Compressor(map_data=comp_map,
-                                                         map_extrap=True),
-                                         promotes_inputs=['Nmech'])
-            self.add_subsystem('burner', pyc.Combustor(fuel_type='FAR'))
-            self.add_subsystem('turb',   pyc.Turbine(map_data=turb_map,
-                                                      map_extrap=True),
-                                         promotes_inputs=['Nmech'])
-            self.add_subsystem('nozz',   pyc.Nozzle(nozzType='CD', lossCoef='Cv'))
-            self.add_subsystem('shaft',  pyc.Shaft(num_ports=2),
-                                         promotes_inputs=['Nmech'])
-            self.add_subsystem('perf',   pyc.Performance(num_nozzles=1,
-                                                          num_burners=1))
-
-            self.pyc_connect_flow('fc.Fl_O',     'inlet.Fl_I',  connect_w=False)
-            self.pyc_connect_flow('inlet.Fl_O',  'comp.Fl_I')
-            self.pyc_connect_flow('comp.Fl_O',   'burner.Fl_I')
-            self.pyc_connect_flow('burner.Fl_O', 'turb.Fl_I')
-            self.pyc_connect_flow('turb.Fl_O',   'nozz.Fl_I')
-
-            self.connect('comp.trq',         'shaft.trq_0')
-            self.connect('turb.trq',         'shaft.trq_1')
-            self.connect('fc.Fl_O:stat:P',   'nozz.Ps_exhaust')
-            self.connect('inlet.Fl_O:tot:P', 'perf.Pt2')
-            self.connect('comp.Fl_O:tot:P',  'perf.Pt3')
-            self.connect('burner.Wfuel',     'perf.Wfuel_0')
-            self.connect('inlet.F_ram',      'perf.ram_drag')
-            self.connect('nozz.Fg',          'perf.Fg_0')
-
             bal = self.add_subsystem('balance', om.BalanceComp())
-
             if design:
                 bal.add_balance('W', units='lbm/s', eq_units='lbf',
                                 rhs_name='Fn_target')
@@ -191,61 +208,17 @@ def _make_turbojet(cfg):
                                 eq_units='hp', rhs_val=0.)
                 self.connect('balance.turb_PR', 'turb.PR')
                 self.connect('shaft.pwr_net',   'balance.lhs:turb_PR')
-
-            newton = self.nonlinear_solver = om.NewtonSolver()
-            newton.options['atol']             = 1e-6
-            newton.options['rtol']             = 1e-6
-            newton.options['iprint']           = 2
-            newton.options['maxiter']          = 15
-            newton.options['solve_subsystems'] = True
-            newton.options['max_sub_solves']   = 100
-            newton.options['reraise_child_analysiserror'] = False
-            self.linear_solver = om.DirectSolver()
             super().setup()
 
     return Turbojet
 
 
 def _make_turbojet_const_tt4(cfg):
-    comp_map = cfg['comp_map']
-    turb_map = cfg['turb_map']
+    _core = _make_turbojet_core(cfg['comp_map'], cfg['turb_map'])
 
     class TurbojetConstTt4(pyc.Cycle):
         def setup(self):
-            self.options['thermo_method'] = 'TABULAR'
-            self.options['thermo_data']   = pyc.AIR_JETA_TAB_SPEC
-            design = self.options['design']
-
-            self.add_subsystem('fc',     pyc.FlightConditions())
-            self.add_subsystem('inlet',  pyc.Inlet())
-            self.add_subsystem('comp',   pyc.Compressor(map_data=comp_map,
-                                                         map_extrap=True),
-                                         promotes_inputs=['Nmech'])
-            self.add_subsystem('burner', pyc.Combustor(fuel_type='FAR'))
-            self.add_subsystem('turb',   pyc.Turbine(map_data=turb_map,
-                                                      map_extrap=True),
-                                         promotes_inputs=['Nmech'])
-            self.add_subsystem('nozz',   pyc.Nozzle(nozzType='CD', lossCoef='Cv'))
-            self.add_subsystem('shaft',  pyc.Shaft(num_ports=2),
-                                         promotes_inputs=['Nmech'])
-            self.add_subsystem('perf',   pyc.Performance(num_nozzles=1,
-                                                          num_burners=1))
-
-            self.pyc_connect_flow('fc.Fl_O',     'inlet.Fl_I',  connect_w=False)
-            self.pyc_connect_flow('inlet.Fl_O',  'comp.Fl_I')
-            self.pyc_connect_flow('comp.Fl_O',   'burner.Fl_I')
-            self.pyc_connect_flow('burner.Fl_O', 'turb.Fl_I')
-            self.pyc_connect_flow('turb.Fl_O',   'nozz.Fl_I')
-
-            self.connect('comp.trq',         'shaft.trq_0')
-            self.connect('turb.trq',         'shaft.trq_1')
-            self.connect('fc.Fl_O:stat:P',   'nozz.Ps_exhaust')
-            self.connect('inlet.Fl_O:tot:P', 'perf.Pt2')
-            self.connect('comp.Fl_O:tot:P',  'perf.Pt3')
-            self.connect('burner.Wfuel',     'perf.Wfuel_0')
-            self.connect('inlet.F_ram',      'perf.ram_drag')
-            self.connect('nozz.Fg',          'perf.Fg_0')
-
+            _core(self)
             bal = self.add_subsystem('balance', om.BalanceComp())
 
             bal.add_balance('FAR', eq_units='degR', lower=1e-4,
@@ -262,61 +235,17 @@ def _make_turbojet_const_tt4(cfg):
                             eq_units='inch**2', rhs_name='nozz_area_target')
             self.connect('balance.W',             'inlet.Fl_I:stat:W')
             self.connect('nozz.Throat:stat:area', 'balance.lhs:W')
-
-            newton = self.nonlinear_solver = om.NewtonSolver()
-            newton.options['atol']             = 1e-6
-            newton.options['rtol']             = 1e-6
-            newton.options['iprint']           = 2
-            newton.options['maxiter']          = 15
-            newton.options['solve_subsystems'] = True
-            newton.options['max_sub_solves']   = 100
-            newton.options['reraise_child_analysiserror'] = False
-            self.linear_solver = om.DirectSolver()
             super().setup()
 
     return TurbojetConstTt4
 
 
 def _make_turbojet_const_fn(cfg):
-    comp_map = cfg['comp_map']
-    turb_map = cfg['turb_map']
+    _core = _make_turbojet_core(cfg['comp_map'], cfg['turb_map'])
 
     class TurbojetConstFn(pyc.Cycle):
         def setup(self):
-            self.options['thermo_method'] = 'TABULAR'
-            self.options['thermo_data']   = pyc.AIR_JETA_TAB_SPEC
-            design = self.options['design']
-
-            self.add_subsystem('fc',     pyc.FlightConditions())
-            self.add_subsystem('inlet',  pyc.Inlet())
-            self.add_subsystem('comp',   pyc.Compressor(map_data=comp_map,
-                                                         map_extrap=True),
-                                         promotes_inputs=['Nmech'])
-            self.add_subsystem('burner', pyc.Combustor(fuel_type='FAR'))
-            self.add_subsystem('turb',   pyc.Turbine(map_data=turb_map,
-                                                      map_extrap=True),
-                                         promotes_inputs=['Nmech'])
-            self.add_subsystem('nozz',   pyc.Nozzle(nozzType='CD', lossCoef='Cv'))
-            self.add_subsystem('shaft',  pyc.Shaft(num_ports=2),
-                                         promotes_inputs=['Nmech'])
-            self.add_subsystem('perf',   pyc.Performance(num_nozzles=1,
-                                                          num_burners=1))
-
-            self.pyc_connect_flow('fc.Fl_O',     'inlet.Fl_I',  connect_w=False)
-            self.pyc_connect_flow('inlet.Fl_O',  'comp.Fl_I')
-            self.pyc_connect_flow('comp.Fl_O',   'burner.Fl_I')
-            self.pyc_connect_flow('burner.Fl_O', 'turb.Fl_I')
-            self.pyc_connect_flow('turb.Fl_O',   'nozz.Fl_I')
-
-            self.connect('comp.trq',         'shaft.trq_0')
-            self.connect('turb.trq',         'shaft.trq_1')
-            self.connect('fc.Fl_O:stat:P',   'nozz.Ps_exhaust')
-            self.connect('inlet.Fl_O:tot:P', 'perf.Pt2')
-            self.connect('comp.Fl_O:tot:P',  'perf.Pt3')
-            self.connect('burner.Wfuel',     'perf.Wfuel_0')
-            self.connect('inlet.F_ram',      'perf.ram_drag')
-            self.connect('nozz.Fg',          'perf.Fg_0')
-
+            _core(self)
             bal = self.add_subsystem('balance', om.BalanceComp())
 
             bal.add_balance('FAR', eq_units='lbf', lower=1e-4,
@@ -333,16 +262,6 @@ def _make_turbojet_const_fn(cfg):
                             eq_units='inch**2', rhs_name='nozz_area_target')
             self.connect('balance.W',             'inlet.Fl_I:stat:W')
             self.connect('nozz.Throat:stat:area', 'balance.lhs:W')
-
-            newton = self.nonlinear_solver = om.NewtonSolver()
-            newton.options['atol']             = 1e-6
-            newton.options['rtol']             = 1e-6
-            newton.options['iprint']           = 2
-            newton.options['maxiter']          = 15
-            newton.options['solve_subsystems'] = True
-            newton.options['max_sub_solves']   = 100
-            newton.options['reraise_child_analysiserror'] = False
-            self.linear_solver = om.DirectSolver()
             super().setup()
 
     return TurbojetConstFn
@@ -352,20 +271,40 @@ def _make_turbojet_const_fn(cfg):
 #  MULTI-POINT MODELS
 # ══════════════════════════════════════════════════════════════════════════════
 
+def _add_design_point_and_params(mp, Turbojet, cfg, include_dPqP=True):
+    """Register DESIGN point, Mach/speed defaults, and cooling cycle params."""
+    mp.pyc_add_pnt('DESIGN', Turbojet())
+    mp.set_input_defaults('DESIGN.Nmech',     cfg['Nmech'],    units='rpm')
+    mp.set_input_defaults('DESIGN.inlet.MN',  cfg['inlet_MN'])
+    mp.set_input_defaults('DESIGN.comp.MN',   cfg['comp_MN'])
+    mp.set_input_defaults('DESIGN.burner.MN', cfg['burner_MN'])
+    mp.set_input_defaults('DESIGN.turb.MN',   cfg['turb_MN'])
+    if include_dPqP:
+        mp.pyc_add_cycle_param('burner.dPqP',          cfg['burner_dPqP'])
+    mp.pyc_add_cycle_param('nozz.Cv',              cfg['nozz_Cv'])
+    mp.pyc_add_cycle_param('bld3.ngv_cool:frac_W', cfg['ngv_cool_frac'])
+    mp.pyc_add_cycle_param('turb.ngv_cool:frac_P', 1.0)
+    mp.pyc_add_cycle_param('bld3.bld_cool:frac_W', cfg['bld_cool_frac'])
+    mp.pyc_add_cycle_param('turb.bld_cool:frac_P', 0.0)
+
+
+def _connect_od_scalars(mp, od_pts):
+    """Propagate DESIGN map scalars and nozzle area to all OD points."""
+    for pt in od_pts:
+        mp.connect('DESIGN.nozz.Throat:stat:area', f'{pt}.balance.nozz_area_target')
+        for sc in ['s_PR', 's_Wc', 's_eff', 's_Nc']:
+            mp.connect(f'DESIGN.comp.{sc}', f'{pt}.comp.{sc}')
+        for sc in ['s_PR', 's_eff', 's_Np']:
+            mp.connect(f'DESIGN.turb.{sc}', f'{pt}.turb.{sc}')
+
+
 def _make_mp_const_tt4(cfg):
-    Turbojet        = _make_turbojet(cfg)
+    Turbojet         = _make_turbojet(cfg)
     TurbojetConstTt4 = _make_turbojet_const_tt4(cfg)
 
     class MPConstTt4(pyc.MPCycle):
         def setup(self):
-            self.pyc_add_pnt('DESIGN', Turbojet())
-            self.set_input_defaults('DESIGN.Nmech',     cfg['Nmech'],    units='rpm')
-            self.set_input_defaults('DESIGN.inlet.MN',  cfg['inlet_MN'])
-            self.set_input_defaults('DESIGN.comp.MN',   cfg['comp_MN'])
-            self.set_input_defaults('DESIGN.burner.MN', cfg['burner_MN'])
-            self.set_input_defaults('DESIGN.turb.MN',   cfg['turb_MN'])
-            self.pyc_add_cycle_param('burner.dPqP', cfg['burner_dPqP'])
-            self.pyc_add_cycle_param('nozz.Cv',     cfg['nozz_Cv'])
+            _add_design_point_and_params(self, Turbojet, cfg)
 
             self.a4_scalars = cfg['a4_scalars']
             self.a4_pts     = [f'A4_{i:03d}' for i in range(len(self.a4_scalars))]
@@ -375,33 +314,19 @@ def _make_mp_const_tt4(cfg):
                 self.set_input_defaults(pt + '.fc.MN',  0.000001)
                 self.set_input_defaults(pt + '.fc.alt', 0.0, units='ft')
 
-            for pt in self.a4_pts:
-                self.connect('DESIGN.nozz.Throat:stat:area',
-                             f'{pt}.balance.nozz_area_target')
-                for sc in ['s_PR', 's_Wc', 's_eff', 's_Nc']:
-                    self.connect(f'DESIGN.comp.{sc}', f'{pt}.comp.{sc}')
-                for sc in ['s_PR', 's_eff', 's_Np']:
-                    self.connect(f'DESIGN.turb.{sc}', f'{pt}.turb.{sc}')
-
+            _connect_od_scalars(self, self.a4_pts)
             super().setup()
 
     return MPConstTt4
 
 
 def _make_mp_const_fn(cfg):
-    Turbojet       = _make_turbojet(cfg)
+    Turbojet        = _make_turbojet(cfg)
     TurbojetConstFn = _make_turbojet_const_fn(cfg)
 
     class MPConstFn(pyc.MPCycle):
         def setup(self):
-            self.pyc_add_pnt('DESIGN', Turbojet())
-            self.set_input_defaults('DESIGN.Nmech',     cfg['Nmech'],    units='rpm')
-            self.set_input_defaults('DESIGN.inlet.MN',  cfg['inlet_MN'])
-            self.set_input_defaults('DESIGN.comp.MN',   cfg['comp_MN'])
-            self.set_input_defaults('DESIGN.burner.MN', cfg['burner_MN'])
-            self.set_input_defaults('DESIGN.turb.MN',   cfg['turb_MN'])
-            self.pyc_add_cycle_param('burner.dPqP', cfg['burner_dPqP'])
-            self.pyc_add_cycle_param('nozz.Cv',     cfg['nozz_Cv'])
+            _add_design_point_and_params(self, Turbojet, cfg)
 
             self.fn_fractions = cfg['fn_fractions']
             self.a4_scalars   = cfg['a4_scalars']
@@ -415,14 +340,7 @@ def _make_mp_const_fn(cfg):
                     self.set_input_defaults(pt + '.fc.MN',  0.000001)
                     self.set_input_defaults(pt + '.fc.alt', 0.0, units='ft')
 
-            for pt in self.od_pts:
-                self.connect('DESIGN.nozz.Throat:stat:area',
-                             f'{pt}.balance.nozz_area_target')
-                for sc in ['s_PR', 's_Wc', 's_eff', 's_Nc']:
-                    self.connect(f'DESIGN.comp.{sc}', f'{pt}.comp.{sc}')
-                for sc in ['s_PR', 's_eff', 's_Np']:
-                    self.connect(f'DESIGN.turb.{sc}', f'{pt}.turb.{sc}')
-
+            _connect_od_scalars(self, self.od_pts)
             super().setup()
 
     return MPConstFn
@@ -451,7 +369,7 @@ def viewer(prob, pt, file=sys.stdout):
     print(' %7.5f  %7.1f %7.3f %7.1f %7.1f %7.1f %7.3f  %7.5f' % summary,
           file=file, flush=True)
     fs_full = [f'{pt}.{fs}' for fs in
-               ['fc.Fl_O', 'inlet.Fl_O', 'comp.Fl_O',
+               ['fc.Fl_O', 'inlet.Fl_O', 'comp.Fl_O', 'bld3.Fl_O',
                 'burner.Fl_O', 'turb.Fl_O', 'nozz.Fl_O']]
     pyc.print_flow_station(prob, fs_full, file=file)
     pyc.print_compressor(prob, [f'{pt}.comp'],  file=file)
@@ -512,10 +430,10 @@ def set_turb_area(prob, pt, a4_scalar, s_Wp_design, mode):
     if mode == 'sWp':
         prob.set_val(f"{pt}.turb.s_Wp", s_Wp_design * a4_scalar)
     elif mode == 'alpha':
-        prob.set_val(f"{pt}.turb.s_Wp", s_Wp_design)   # ← hold at design, alpha handles area
         prob.set_val(f"{pt}.turb.map.alphaMap", a4_scalar)
+        prob.set_val(f"{pt}.turb.s_Wp", s_Wp_design)  # alphaMap controls area; s_Wp stays at design
     else:
-        raise ValueError(f"Unknown TURB_AREA_MODE: {mode!r}")
+        raise ValueError(f"Unknown TURB_AREA_MODE: {mode!r}  (use 'sWp' or 'alpha')")
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -625,7 +543,6 @@ def run_study2(cfg, mode, design_results_s1):
     prob.set_val('DESIGN.comp.PR',           cfg['OPR'])
     prob.set_val('DESIGN.comp.eff',          cfg['comp_eff'])
     prob.set_val('DESIGN.turb.eff',          cfg['turb_eff'])
-    
     prob['DESIGN.balance.FAR']     = cfg.get('FAR_guess',     0.0175)
     prob['DESIGN.balance.W']       = cfg.get('W_guess',       168.0)
     prob['DESIGN.balance.turb_PR'] = cfg.get('turb_PR_guess', 3.5)
@@ -723,18 +640,13 @@ def _summarise_const_fn(fn_fractions, a4_scalars, const_fn_results,
 
 def _make_mp_single_fn(cfg):
     """Single-Fn MPCycle for the physics dP/P Gauss-Seidel sweeps."""
-    Turbojet       = _make_turbojet(cfg)
+    Turbojet        = _make_turbojet(cfg)
     TurbojetConstFn = _make_turbojet_const_fn(cfg)
 
     class MPSingleFn(pyc.MPCycle):
         def setup(self):
-            self.pyc_add_pnt('DESIGN', Turbojet())
-            self.set_input_defaults('DESIGN.Nmech',     cfg['Nmech'],    units='rpm')
-            self.set_input_defaults('DESIGN.inlet.MN',  cfg['inlet_MN'])
-            self.set_input_defaults('DESIGN.comp.MN',   cfg['comp_MN'])
-            self.set_input_defaults('DESIGN.burner.MN', cfg['burner_MN'])
-            self.set_input_defaults('DESIGN.turb.MN',   cfg['turb_MN'])
-            self.pyc_add_cycle_param('nozz.Cv', cfg['nozz_Cv'])
+            # dPqP is set per-point in the physics sweep, not as a cycle param
+            _add_design_point_and_params(self, Turbojet, cfg, include_dPqP=False)
 
             self.a4_scalars = cfg['a4_scalars']
             self.od_pts     = [f'A4_{i:03d}' for i in range(len(self.a4_scalars))]
@@ -744,14 +656,7 @@ def _make_mp_single_fn(cfg):
                 self.set_input_defaults(pt + '.fc.MN',  0.000001)
                 self.set_input_defaults(pt + '.fc.alt', 0.0, units='ft')
 
-            for pt in self.od_pts:
-                self.connect('DESIGN.nozz.Throat:stat:area',
-                             f'{pt}.balance.nozz_area_target')
-                for sc in ['s_PR', 's_Wc', 's_eff', 's_Nc']:
-                    self.connect(f'DESIGN.comp.{sc}', f'{pt}.comp.{sc}')
-                for sc in ['s_PR', 's_eff', 's_Np']:
-                    self.connect(f'DESIGN.turb.{sc}', f'{pt}.turb.{sc}')
-
+            _connect_od_scalars(self, self.od_pts)
             super().setup()
 
     return MPSingleFn
@@ -783,12 +688,6 @@ def run_fixed_dPqP_sweep(prob, mp, design_results, fn_frac, cfg, mode):
                                        * fn_frac**0.5 * (1.0/a4)**0.3)
         prob[pt + '.balance.FAR']   = cfg.get('FAR_guess', 0.017) * fn_frac
         prob.model._get_subsystem(pt).nonlinear_solver.options['maxiter'] = 15
-    for pt, a4 in zip(mp.od_pts, mp.a4_scalars):
-        print(f"    {pt}  s_Wp={prob.get_val(f'{pt}.turb.s_Wp')[0]:.6f}"
-          f"  alphaMap={prob.get_val(f'{pt}.turb.map.alphaMap')[0]:.4f}"
-          f"  turb_PR={prob.get_val(f'{pt}.turb.PR')[0]:.4f}"
-          f"  turb_eff={prob.get_val(f'{pt}.turb.eff')[0]:.5f}"
-          f"  eta_th={extract_eta_th(prob, pt):.5f}")
 
     _run_od_sweep_sequential(prob, mp)
 
@@ -1047,8 +946,19 @@ if __name__ == '__main__':
     from EngineHPT_map_fixed import EngineHPTMap as EngineHPTFixedMap
 
     # ══════════════════════════════════════════════════════════════
+    #  COOLING MODEL CONSTANTS
+    # ══════════════════════════════════════════════════════════════
+    # Fixed fractions — Walsh & Fletcher (2004) §5.4: total HPT cooling
+    # ~10-12% of W3 for single-stage HPT at TIT 1300-1450 K, split ~equally.
+    NGV_COOL_FRAC   = 0.05   # non-chargeable: NGV/stator, frac_P=1.0 on turbine
+    BLD_COOL_FRAC   = 0.05   # chargeable: rotor blade, frac_P=0.0 on turbine
+    TOTAL_COOL_FRAC = NGV_COOL_FRAC + BLD_COOL_FRAC
+
+    ETA_COOL    = 0.65    # film cooling effectiveness (Horlock et al. 2001)
+    T_METAL_MAX = 1200    # K — reference material limit for T_metal tracking
+
+    # ══════════════════════════════════════════════════════════════
     #  MAP DESIGN POINT EXTRACTION
-    #  Read turb_eff and turb_PR from each map at design Np/alpha
     #  pyCycle Np convention: N / sqrt(Tt_degR), Tref = 1 degR
     # ══════════════════════════════════════════════════════════════
 
@@ -1058,16 +968,16 @@ if __name__ == '__main__':
 
     def map_design_point(turb_map, Np_des, alpha_design=1.0):
         """Read design efficiency from map at defaults operating point."""
-        a_idx     = int(np.argmin(np.abs(np.array(turb_map.alphaMap) - alpha_design)))
-        eff_slice = np.array(turb_map.effMap[a_idx])
-        NpMap     = np.array(turb_map.NpMap)
-        PRmap     = np.array(turb_map.PRmap)
-        PR_des    = turb_map.defaults['PRmap']   # use actual design PR
-        Np_q      = float(np.clip(Np_des, NpMap[0], NpMap[-1]))
-        interp    = RegularGridInterpolator(
-            (NpMap, PRmap), eff_slice,
+        a_idx   = int(np.argmin(np.abs(np.array(turb_map.alphaMap) - alpha_design)))
+        eff_sl  = np.array(turb_map.effMap[a_idx])
+        NpMap   = np.array(turb_map.NpMap)
+        PRmap   = np.array(turb_map.PRmap)
+        PR_des  = turb_map.defaults['PRmap']
+        Np_q    = float(np.clip(Np_des, NpMap[0], NpMap[-1]))
+        interp  = RegularGridInterpolator(
+            (NpMap, PRmap), eff_sl,
             method='linear', bounds_error=False, fill_value=None)
-        eff_des   = float(interp([[Np_q, PR_des]]))
+        eff_des = float(interp([[Np_q, PR_des]]))
         return eff_des, PR_des
 
     eff_fixed, PR_fixed = map_design_point(EngineHPTFixedMap, _Np_des)
@@ -1081,59 +991,58 @@ if __name__ == '__main__':
     print("=" * 65)
 
     # ╔══════════════════════════════════════════════════════════════╗
-    # ║  SHARED CYCLE CONFIG — identical targets for both engines    ║
+    # ║  SHARED CYCLE CONFIG                                        ║
     # ╚══════════════════════════════════════════════════════════════╝
-    n_scale = 1.0
     BASE_CFG = dict(
         comp_map     = pyc.HPCMap,
-        Fn_design    = 11800.0*n_scale,   # lbf
-        T4_design    = 2370.0,    # degR
-        OPR          = 13.5*n_scale,
+        Fn_design    = 11800.0,   # lbf
+        T4_design    = _T4_degR,    # degR
+        OPR          = 13.5*0.5,
         Nmech        = _Nmech,    # rpm
         comp_eff     = 0.83,
         inlet_MN     = 0.60,
         comp_MN      = 0.020,
         burner_MN    = 0.020,
         turb_MN      = 0.40,
-        burner_dPqP  = 0.03,
         nozz_Cv      = 0.99,
         FAR_guess    = 0.0175,
         W_guess      = 168.0,
-        fn_fractions = [0.60, 1.00],
-        a4_scalars = np.linspace(0.80, 1.05, 10)
+        fn_fractions = [0.50, 1.00],
+        a4_scalars   = list(np.linspace(0.80, 1.10, 15)),
+        ngv_cool_frac = NGV_COOL_FRAC,
+        bld_cool_frac = BLD_COOL_FRAC,
     )
-    
+
     CFG_FIXED = {
         **BASE_CFG,
         'turb_map'     : EngineHPTFixedMap,
         'turb_eff'     : eff_fixed,
         'turb_PR_guess': PR_fixed,
-        'a4_scalars'   : [1.0] * 10,   # no area variation
+        'a4_scalars'   : [1.0],        # fixed geometry — single point
     }
     CFG_VGT = {
         **BASE_CFG,
         'turb_map'     : EngineHPTVGTMap,
         'turb_eff'     : eff_vgt,
         'turb_PR_guess': PR_vgt,
-        'a4_scalars': np.linspace(0.75, 1.05, 10),
     }
     
-
     print("=" * 65)
-    print(f" Fixed vs VGT Comparison — physics dP/P")
+    print(f" Fixed vs VGT — physics dP/P + blade temperature")
     print(f" Fn levels: {[int(f*100) for f in BASE_CFG['fn_fractions']]}%")
-    print(f" A4: {BASE_CFG['a4_scalars'][0]:.2f}→{BASE_CFG['a4_scalars'][-1]:.2f}"
-          f"  ({len(BASE_CFG['a4_scalars'])} pts)")
+    print(f" VGT A4: {CFG_VGT['a4_scalars'][0]:.2f}→"
+          f"{CFG_VGT['a4_scalars'][-1]:.2f}"
+          f"  ({len(CFG_VGT['a4_scalars'])} pts)")
     print("=" * 65)
-    """
+
     all_results = {}
 
     for label, cfg, mode in [
         ('fixed', CFG_FIXED, 'sWp'),
-        ('vgt',   CFG_VGT,   'alpha'),
+        ('vgt',   CFG_VGT,   'sWp'),
     ]:
         print(f"\n{'█'*65}")
-        print(f" {label.upper()} TURBINE — combustor sweeps")
+        print(f" {label.upper()} TURBINE")
         print(f"{'█'*65}")
 
         MPSingleFn = _make_mp_single_fn(cfg)
@@ -1148,7 +1057,9 @@ if __name__ == '__main__':
         prob_cb.set_val('DESIGN.comp.PR',           cfg['OPR'])
         prob_cb.set_val('DESIGN.comp.eff',          cfg['comp_eff'])
         prob_cb.set_val('DESIGN.turb.eff',          cfg['turb_eff'])
-        prob_cb.set_val('DESIGN.burner.dPqP',       DPQP_FIXED)       # ← add here
+        prob_cb.set_val('DESIGN.burner.dPqP',       DPQP_FIXED)
+        if mode == 'alpha':
+            prob_cb.set_val('DESIGN.turb.map.alphaMap', 1.0)
         prob_cb['DESIGN.balance.FAR']     = cfg.get('FAR_guess', 0.0175)
         prob_cb['DESIGN.balance.W']       = cfg.get('W_guess', 168.0)
         prob_cb['DESIGN.balance.turb_PR'] = cfg.get('turb_PR_guess', 3.5)
@@ -1161,37 +1072,44 @@ if __name__ == '__main__':
         prob_cb.run_model()
 
         des_cb = extract_design(prob_cb)
+
+        # ── Sanity check scale factors ────────────────────────────────────
+        s_eff = prob_cb.get_val('DESIGN.turb.s_eff')[0]
+        s_Wp  = prob_cb.get_val('DESIGN.turb.s_Wp')[0]
+
         print(f"  nozz area = {prob_cb.get_val('DESIGN.nozz.Throat:stat:area')[0]:.4f} in²")
-        print(f"\n  Design: eta={des_cb['eff_design']*100:.3f}%"
-              f"  s_Wp={des_cb['s_Wp_design']:.6f}"
+        print(f"  Design: eta={des_cb['eff_design']*100:.3f}%"
+              f"  s_Wp={s_Wp:.6f}  s_eff={s_eff:.6f}"
               f"  TSFC={des_cb['TSFC']:.5f}")
 
-        # ── Fixed dP/P sweep ─────────────────────────────────────────────
-        # Use initial CdA from design point only as a placeholder —
-        # the re-anchor below overwrites it for both engines.
+        # ── Design-point T_metal (reference, not a constraint) ───────────
+        Tt4_des_K = des_cb['T4_design'] * RANKINE_TO_K
+        T3_des_K  = des_cb['T3_design'] * RANKINE_TO_K
+        T_metal_des = Tt4_des_K - ETA_COOL * TOTAL_COOL_FRAC * (Tt4_des_K - T3_des_K)
+        print(f"  Cooling: NGV={NGV_COOL_FRAC*100:.0f}%  blade={BLD_COOL_FRAC*100:.0f}%"
+              f"  T_metal_des={T_metal_des:.1f}K  (ref limit={T_METAL_MAX:.0f}K)")
+
+        # ── CdA from design point (placeholder) ──────────────────────────
         des_cb['CdA_liner'] = calc_CdA_liner(
-            rankine_to_kelvin(des_cb['T3_design']),
+            T3_des_K,
             psi_to_pa(des_cb['P3_design']),
             lbm_s_to_kg_s(des_cb['W']),
         )
 
-        # Fixed dP/P sweep
+        # ── Fixed dP/P sweep ─────────────────────────────────────────────
         fixed_by_fn = {}
         for fn_frac in cfg['fn_fractions']:
             fixed_by_fn[fn_frac] = run_fixed_dPqP_sweep(
                 prob_cb, mp_cb, des_cb, fn_frac, cfg, mode)
 
-        # ── Re-anchor CdA — computed once from fixed turbine, reused for VGT
-        # Guarantees dP/P = 5% at 100% Fn, A4=1.0 for both engines.
-        # Fixed turbine sets the reference; VGT uses the same CdA so any
-        # difference in physics dP/P is purely from cycle coupling, not
-        # from different combustor geometry.
+        # ── Re-anchor CdA from 100% Fn, A4=1.0 ───────────────────────────
         if 1.00 in fixed_by_fn:
             anc = min(fixed_by_fn[1.00], key=lambda r: abs(r['a4_scalar'] - 1.0))
             CdA = calc_CdA_liner(
-                rankine_to_kelvin(anc['T3']), psi_to_pa(anc['P3']),
+                rankine_to_kelvin(anc['T3']),
+                psi_to_pa(anc['P3']),
                 lbm_s_to_kg_s(anc['W']))
-            des_cb['CdA_liner'] = CdA        # ← inside the if
+            des_cb['CdA_liner'] = CdA
             print(f"  CdA (re-anchored) = {CdA*1e4:.4f} cm²")
 
         # ── Physics dP/P sweep ───────────────────────────────────────────
@@ -1200,246 +1118,190 @@ if __name__ == '__main__':
             physics_by_fn[fn_frac] = run_physics_dPqP_sweep(
                 prob_cb, mp_cb, des_cb, fn_frac, cfg, mode)
 
+        # ── Blade temperature at each operating point ─────────────────────
+        # T_metal = Tt4 - eta_cool * frac_W * (Tt4 - T3)
+        for fn_frac in cfg['fn_fractions']:
+            for r in physics_by_fn[fn_frac]:
+                Tt4_K = r['T4'] * RANKINE_TO_K
+                T3_K  = r['T3'] * RANKINE_TO_K
+                r['T_metal'] = Tt4_K - ETA_COOL * TOTAL_COOL_FRAC * (Tt4_K - T3_K)
+
         all_results[label] = {
-            'des':        des_cb,
-            'fixed_dpqp': fixed_by_fn,
-            'phys_dpqp':  physics_by_fn,
+            'des':         des_cb,
+            'frac_W':      TOTAL_COOL_FRAC,
+            'T_metal_des': T_metal_des,
+            'fixed_dpqp':  fixed_by_fn,
+            'phys_dpqp':   physics_by_fn,
         }
-    
 
-    # ── Comparison plot ───────────────────────────────────────────────────
+    # ══════════════════════════════════════════════════════════════
+    #  FIGURE 1 — THERMAL EFFICIENCY
+    # ══════════════════════════════════════════════════════════════
+
+    def _style_subplot(ax, fn_frac, ylabel):
+        ax.axvline(1.0, color='gray', ls=':', lw=1.2, alpha=0.7)
+        ax.set_title(f'{fn_frac*100:.0f}% Fₙ', fontsize=11, fontweight='bold')
+        ax.set_xlabel('A₄ scalar  (1.0 = design)', fontsize=10)
+        ax.set_ylabel(ylabel, fontsize=10)
+        ax.legend(fontsize=7)
+        ax.grid(True, alpha=0.25)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+
     fn_fracs = BASE_CFG['fn_fractions']
-    a4_arr   = np.array(BASE_CFG['a4_scalars'])
+    ncols    = len(fn_fracs)
 
-    fig, axes = plt.subplots(1, len(fn_fracs),
-                              figsize=(6*len(fn_fracs), 6), sharey=False)
-    if len(fn_fracs) == 1:
-        axes = [axes]
-    fig.suptitle(
-        "Fixed vs Variable Geometry Turbine — Thermal Efficiency\n"
-        "Horizontal = fixed turbine  |  Curve = VGT varying A₄",
-        fontsize=12, fontweight='bold')
+    fig1, axes1 = plt.subplots(1, ncols, figsize=(6*ncols, 5), sharey=False)
+    if ncols == 1:
+        axes1 = [axes1]
+    fig1.suptitle('Fixed vs Variable Geometry Turbine — Thermal Efficiency',
+                  fontsize=12, fontweight='bold')
 
-    for ax, fn_frac in zip(axes, fn_fracs):
-        # ── Fixed turbine lines (horizontal) ─────────────────────────────
+    for col, fn_frac in enumerate(fn_fracs):
+        ax = axes1[col]
+
         eta_fix_f = np.mean([r['eta_th'] for r in
                              all_results['fixed']['fixed_dpqp'][fn_frac]]) * 100
         eta_fix_p = np.mean([r['eta_th'] for r in
                              all_results['fixed']['phys_dpqp'][fn_frac]]) * 100
 
         ax.axhline(eta_fix_f, color='steelblue', ls='--', lw=2,
-                   label='Fixed turbine — fixed dP/P')
+                   label='Fixed — fixed dP/P')
         ax.axhline(eta_fix_p, color='steelblue', ls='-',  lw=2,
-                   label='Fixed turbine — physics dP/P')
+                   label='Fixed — physics dP/P')
 
-        # ── VGT curves ───────────────────────────────────────────────────
-        vgt_f_res = all_results['vgt']['fixed_dpqp'][fn_frac]
-        vgt_p_res = all_results['vgt']['phys_dpqp'][fn_frac]
+        vgt_f = all_results['vgt']['fixed_dpqp'][fn_frac]
+        vgt_p = all_results['vgt']['phys_dpqp'][fn_frac]
+        s_f   = np.array([r['a4_scalar'] for r in vgt_f])
+        s_p   = np.array([r['a4_scalar'] for r in vgt_p])
+        ax.plot(s_f, np.array([r['eta_th'] for r in vgt_f])*100,
+                'o--', color='firebrick', lw=2, ms=5, label='VGT — fixed dP/P')
+        ax.plot(s_p, np.array([r['eta_th'] for r in vgt_p])*100,
+                'o-',  color='firebrick', lw=2, ms=5, label='VGT — physics dP/P')
 
-        s_f   = np.array([r['a4_scalar'] for r in vgt_f_res])
-        eta_f = np.array([r['eta_th']    for r in vgt_f_res]) * 100
-        s_p   = np.array([r['a4_scalar'] for r in vgt_p_res])
-        eta_p = np.array([r['eta_th']    for r in vgt_p_res]) * 100
+        _style_subplot(ax, fn_frac, 'η_th (%)')
 
-        ax.plot(s_f, eta_f, 'o-', color='firebrick', lw=2, ms=5,
-                ls='--', label='VGT — fixed dP/P')
-        ax.plot(s_p, eta_p, 'o-', color='firebrick', lw=2, ms=5,
-                ls='-',  label='VGT — physics dP/P')
+    fig1.tight_layout()
+    fig1.savefig('fixed_vs_vgt_eta_th.png', dpi=150, bbox_inches='tight')
 
-        # ── Design point marker ───────────────────────────────────────────
-        ax.axvline(1.0, color='gray', ls=':', lw=1.2, alpha=0.7)
+    # ══════════════════════════════════════════════════════════════
+    #  FIGURE 2 — ΔT_METAL vs A4 SCALAR
+    #  Primary trace: ΔT = T_metal(VGT, A4) − T_metal(fixed)
+    #  Zero line = fixed geometry baseline; negative = VGT cooler
+    # ══════════════════════════════════════════════════════════════
 
-        ax.set_xlabel('A₄ scalar  (1.0 = design)', fontsize=10)
-        ax.set_ylabel('η_th (%)', fontsize=10)
-        ax.set_title(f'{fn_frac*100:.0f}% Fₙ', fontsize=11,
-                     fontweight='bold')
-        ax.legend(fontsize=8)
-        ax.grid(True, alpha=0.25)
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
+    fig2, axes2 = plt.subplots(1, ncols, figsize=(6*ncols, 5),
+                                sharey=True if ncols > 1 else False)
+    if ncols == 1:
+        axes2 = [axes2]
+    fig2.suptitle(
+        'Variable Geometry Turbine — Blade Metal Temperature Change vs Fixed\n'
+        f'Cooling: NGV={NGV_COOL_FRAC*100:.0f}%  blade={BLD_COOL_FRAC*100:.0f}%'
+        f'  η_cool={ETA_COOL}  (Horlock 2001)',
+        fontsize=11, fontweight='bold')
 
-    plt.tight_layout()
-    plt.savefig('fixed_vs_vgt_comparison.png', dpi=150, bbox_inches='tight')
+    for col, fn_frac in enumerate(fn_fracs):
+        ax = axes2[col]
+
+        T_metal_fix = np.mean([r['T_metal'] for r in
+                               all_results['fixed']['phys_dpqp'][fn_frac]])
+
+        vgt_p       = all_results['vgt']['phys_dpqp'][fn_frac]
+        s_p         = np.array([r['a4_scalar'] for r in vgt_p])
+        T_metal_vgt = np.array([r['T_metal']   for r in vgt_p])
+        dT          = T_metal_vgt - T_metal_fix   # negative = VGT cooler than fixed
+
+        ax.axhline(0.0, color='steelblue', ls='-', lw=1.8,
+                   label=f'Fixed baseline  ({T_metal_fix:.0f} K)')
+        ax.axhline(T_METAL_MAX - T_metal_fix, color='k', ls='--', lw=1.3,
+                   alpha=0.6, label=f'Material limit ({T_METAL_MAX:.0f} K)')
+
+        ax.plot(s_p, dT, 'o-', color='firebrick', lw=2, ms=5,
+                label='VGT − Fixed')
+        ax.fill_between(s_p, 0, dT,
+                        where=(dT <= 0), alpha=0.15, color='steelblue',
+                        label='VGT cooler')
+        ax.fill_between(s_p, 0, dT,
+                        where=(dT > 0),  alpha=0.15, color='firebrick',
+                        label='VGT hotter')
+
+        # Annotate at A4=1.0 (unscaled VGT) and at optimum-η A4
+        idx_unit = int(np.argmin(np.abs(s_p - 1.0)))
+        ax.annotate(f'A₄=1.0\nΔT={dT[idx_unit]:+.1f}K',
+                    xy=(s_p[idx_unit], dT[idx_unit]),
+                    xytext=(s_p[idx_unit] + 0.03, dT[idx_unit] - 3),
+                    fontsize=8, color='gray',
+                    arrowprops=dict(arrowstyle='->', color='gray', lw=0.7))
+
+        opt_idx = int(np.argmin(dT))   # A4 that minimises T_metal
+        ax.annotate(f'Min ΔT: A₄={s_p[opt_idx]:.2f}\nΔT={dT[opt_idx]:+.1f}K',
+                    xy=(s_p[opt_idx], dT[opt_idx]),
+                    xytext=(s_p[opt_idx] + 0.03, dT[opt_idx] + 3),
+                    fontsize=8, color='steelblue',
+                    bbox=dict(boxstyle='round,pad=0.3', fc='white',
+                              ec='steelblue', alpha=0.9),
+                    arrowprops=dict(arrowstyle='->', color='steelblue', lw=0.8))
+
+        _style_subplot(ax, fn_frac, 'ΔT_metal  (K)  [VGT − Fixed]')
+
+    fig2.tight_layout()
+    fig2.savefig('fixed_vs_vgt_delta_Tmetal.png', dpi=150, bbox_inches='tight')
     plt.show()
-    """
+
+    # ── Raw data table ─────────────────────────────────────────────────────
+    HDR = (f"  {'Fn%':>4}  {'Config':>5}  {'A4':>6}  {'T4 (K)':>8}  "
+           f"{'Nmech':>7}  {'OPR':>6}  {'TSFC':>9}  {'η_th%':>7}  "
+           f"{'T_metal':>8}  {'dPqP%':>6}")
+    SEP = "  " + "-" * (len(HDR) - 2)
+
+    print("\n" + "=" * len(HDR))
+    print("  RAW DATA — physics dP/P sweep")
+    print("=" * len(HDR))
+    print(HDR)
+    print(SEP)
+
+    for fn_frac in fn_fracs:
+        fix_pts = all_results['fixed']['phys_dpqp'][fn_frac]
+        vgt_pts = all_results['vgt']['phys_dpqp'][fn_frac]
+
+        # Fixed is a single A4=1.0 point; repeat label for alignment
+        for r in fix_pts:
+            print(f"  {int(fn_frac*100):4d}  {'fixed':>5}  {r['a4_scalar']:6.3f}"
+                  f"  {r['T4']*RANKINE_TO_K:8.1f}  {r['Nmech']:7.1f}"
+                  f"  {r['comp_PR']:6.3f}  {r['TSFC']:9.5f}"
+                  f"  {r['eta_th']*100:7.4f}  {r['T_metal']:8.1f}"
+                  f"  {r['dPqP']*100:6.3f}")
+
+        print(SEP)
+
+        for r in vgt_pts:
+            print(f"  {int(fn_frac*100):4d}  {'vgt':>5}  {r['a4_scalar']:6.3f}"
+                  f"  {r['T4']*RANKINE_TO_K:8.1f}  {r['Nmech']:7.1f}"
+                  f"  {r['comp_PR']:6.3f}  {r['TSFC']:9.5f}"
+                  f"  {r['eta_th']*100:7.4f}  {r['T_metal']:8.1f}"
+                  f"  {r['dPqP']*100:6.3f}")
+
+        print(SEP)
+
+    # ── Summary table ──────────────────────────────────────────────────────
+    print("\n" + "=" * len(HDR))
+    print("  SUMMARY — Fixed vs VGT at optimal A4 (physics dP/P)")
+    print("=" * len(HDR))
+    print(f"  {'Fn (%)':>7}  {'η_th fixed':>12}  {'η_th VGT':>10}"
+          f"  {'Δη_th':>8}  {'T_metal fix':>12}  {'T_metal VGT':>12}  {'ΔT (K)':>8}")
+    print("  " + "-" * (len(HDR) - 2))
+    for fn_frac in fn_fracs:
+        eta_f   = np.mean([r['eta_th']  for r in
+                           all_results['fixed']['phys_dpqp'][fn_frac]]) * 100
+        T_f     = np.mean([r['T_metal'] for r in
+                           all_results['fixed']['phys_dpqp'][fn_frac]])
+        vgt_res = all_results['vgt']['phys_dpqp'][fn_frac]
+        opt_idx = int(np.argmin([r['T_metal'] for r in vgt_res]))
+        eta_v   = vgt_res[opt_idx]['eta_th'] * 100
+        T_v     = vgt_res[opt_idx]['T_metal']
+        a4_opt  = vgt_res[opt_idx]['a4_scalar']
+        print(f"  {int(fn_frac*100):7d}  {eta_f:12.4f}  {eta_v:10.4f}"
+              f"  {eta_v-eta_f:+8.4f}  {T_f:12.1f}  {T_v:12.1f}  {T_v-T_f:+8.1f}"
+              f"  (A4_opt={a4_opt:.3f})")
     
-
-    OPR_vals = np.linspace(5,  15, 6)    # 6 pts — ~2 OPR steps
-    Tt4_vals = np.linspace(1000, 1600, 6)    # 6 K → degR inside loop
-    # 36 design solves × 2 turbines = 72 total — manageable
-
-    # Results shape: (n_OPR, n_Tt4, n_fn_fracs)
-    n_opr  = len(OPR_vals)
-    n_tt4  = len(Tt4_vals)
-    fn_fracs_sweep = BASE_CFG['fn_fractions']   # e.g. [0.80, 1.00]
-
-    delta_eta = np.full((n_opr, n_tt4, len(fn_fracs_sweep)), np.nan)
-
-    for i, opr in enumerate(OPR_vals):
-        for j, tt4_K in enumerate(Tt4_vals):
-            tt4_R = tt4_K * 9.0 / 5.0
-
-            print(f"\n{'='*55}")
-            print(f"  OPR={opr:.1f}  Tt4={tt4_K:.0f}K  ({tt4_R:.0f}°R)")
-            print(f"{'='*55}")
-
-            # Re-extract map design efficiency at this Tt4
-            # Np changes with Tt4 so eff lookup needs updating
-            Np_des_ij = _Nmech / np.sqrt(tt4_R)
-            eff_fixed_ij, PR_fixed_ij = map_design_point(EngineHPTFixedMap, Np_des_ij)
-            eff_vgt_ij,   PR_vgt_ij   = map_design_point(EngineHPTVGTMap,   Np_des_ij)
-
-            cfg_f = {
-                **BASE_CFG,
-                'turb_map'     : EngineHPTFixedMap,
-                'turb_eff'     : eff_fixed_ij,
-                'turb_PR_guess': PR_fixed_ij,
-                'OPR'          : opr,
-                'T4_design'    : tt4_R,
-                'a4_scalars'   : [1.0] * 3,
-            }
-            cfg_v = {
-                **BASE_CFG,
-                'turb_map'     : EngineHPTVGTMap,
-                'turb_eff'     : eff_vgt_ij,
-                'turb_PR_guess': PR_vgt_ij,
-                'OPR'          : opr,
-                'T4_design'    : tt4_R,
-                'a4_scalars'   : list(np.linspace(0.75, 1.10, 10)),
-            }
-
-            results_ij = {}
-            shared_CdA_ij = None
-
-            for label, cfg, mode in [
-                ('fixed', cfg_f, 'sWp'),
-                ('vgt',   cfg_v, 'alpha'),
-            ]:
-                try:
-                    MPSingleFn = _make_mp_single_fn(cfg)
-                    prob_ij    = om.Problem()
-                    mp_ij      = prob_ij.model = MPSingleFn()
-                    prob_ij.setup(check=False)
-
-                    prob_ij.set_val('DESIGN.fc.alt',            0.0,              units='ft')
-                    prob_ij.set_val('DESIGN.fc.MN',             0.000001)
-                    prob_ij.set_val('DESIGN.balance.Fn_target', cfg['Fn_design'], units='lbf')
-                    prob_ij.set_val('DESIGN.balance.T4_target', cfg['T4_design'], units='degR')
-                    prob_ij.set_val('DESIGN.comp.PR',           cfg['OPR'])
-                    prob_ij.set_val('DESIGN.comp.eff',          cfg['comp_eff'])
-                    prob_ij.set_val('DESIGN.turb.eff',          cfg['turb_eff'])
-                    prob_ij['DESIGN.balance.FAR']     = cfg.get('FAR_guess', 0.0175)
-                    prob_ij['DESIGN.balance.W']       = cfg.get('W_guess',   168.0)
-                    prob_ij['DESIGN.balance.turb_PR'] = cfg.get('turb_PR_guess', 3.5)
-                    prob_ij['DESIGN.fc.balance.Pt']   = 14.696
-                    prob_ij['DESIGN.fc.balance.Tt']   = 518.67
-                    if mode == 'alpha':
-                        prob_ij.set_val('DESIGN.turb.map.alphaMap', 1.0)
-                    for pt in mp_ij.od_pts:
-                        prob_ij.model._get_subsystem(pt).nonlinear_solver.options['maxiter'] = 0
-                    prob_ij.set_solver_print(level=-1)
-                    prob_ij.run_model()
-
-                    des_ij = extract_design(prob_ij)
-
-                    # Initial CdA from design
-                    des_ij['CdA_liner'] = calc_CdA_liner(
-                        rankine_to_kelvin(des_ij['T3_design']),
-                        psi_to_pa(des_ij['P3_design']),
-                        lbm_s_to_kg_s(des_ij['W']),
-                    )
-
-                    # Fixed dP/P sweep to anchor CdA
-                    fixed_ij = {}
-                    for fn_frac in fn_fracs_sweep:
-                        fixed_ij[fn_frac] = run_fixed_dPqP_sweep(
-                            prob_ij, mp_ij, des_ij, fn_frac, cfg, mode)
-
-                    # Per-engine re-anchor
-                    if 1.00 in fixed_ij:
-                        anc = min(fixed_ij[1.00],
-                                key=lambda r: abs(r['a4_scalar'] - 1.0))
-                        des_ij['CdA_liner'] = calc_CdA_liner(
-                            rankine_to_kelvin(anc['T3']),
-                            psi_to_pa(anc['P3']),
-                            lbm_s_to_kg_s(anc['W']))
-
-                    # Physics dP/P sweep
-                    phys_ij = {}
-                    for fn_frac in fn_fracs_sweep:
-                        phys_ij[fn_frac] = run_physics_dPqP_sweep(
-                            prob_ij, mp_ij, des_ij, fn_frac, cfg, mode)
-
-                    results_ij[label] = phys_ij
-
-                except Exception as e:
-                    print(f"  !! FAILED {label} OPR={opr} Tt4={tt4_K}: {e}")
-                    results_ij[label] = None
-
-            # Compute Δη_th at each Fn level
-            if results_ij.get('fixed') and results_ij.get('vgt'):
-                for k, fn_frac in enumerate(fn_fracs_sweep):
-                    # Best VGT point (optimal alpha) vs fixed
-                    eta_f = np.mean([r['eta_th']
-                                    for r in results_ij['fixed'][fn_frac]])
-                    eta_v = max(r['eta_th']
-                                for r in results_ij['vgt'][fn_frac])
-                    delta_eta[i, j, k] = (eta_v - eta_f) / eta_f * 100.0
-                    print(f"  OPR={opr:.1f} Tt4={tt4_K:.0f}K "
-                        f"Fn={fn_frac*100:.0f}%  "
-                        f"Δη_th={delta_eta[i,j,k]:+.3f}%")
-                    print(f"eta_f     = {eta_f*100:.4f}%")
-
-
-    # ── Plot contour map ──────────────────────────────────────────
-    fig_map, axes_map = plt.subplots(1, len(fn_fracs_sweep),
-                                    figsize=(7*len(fn_fracs_sweep), 6),
-                                    sharey=True)
-    if len(fn_fracs_sweep) == 1:
-        axes_map = [axes_map]
-
-    OPR_grid, Tt4_grid = np.meshgrid(OPR_vals, Tt4_vals, indexing='ij')
-
-    for ax, k, fn_frac in zip(axes_map, range(len(fn_fracs_sweep)), fn_fracs_sweep):
-        Z = delta_eta[:, :, k]
-
-        # Filled contour
-        vmax = np.nanmax(np.abs(Z))
-        cf   = ax.contourf(OPR_grid, Tt4_grid, Z,
-                        levels=20,
-                        cmap='RdBu',
-                        vmin=-vmax, vmax=vmax)
-        plt.colorbar(cf, ax=ax, label='Δη_th (%) — VGT minus Fixed')
-
-        # Zero-crossing contour — break-even line
-        cs = ax.contour(OPR_grid, Tt4_grid, Z,
-                        levels=[0.0],
-                        colors='k', linewidths=2.5)
-        ax.clabel(cs, fmt='Break-even', fontsize=9)
-
-        # Design point marker
-        ax.plot(13.5, 1316.7, '*', ms=14, color='gold',
-                markeredgecolor='k', zorder=5, label='Your design point')
-
-        ax.set_xlabel('Overall Pressure Ratio (OPR)', fontsize=11)
-        ax.set_ylabel('Turbine Inlet Temperature Tt4 (K)', fontsize=11)
-        ax.set_title(f'VGT Benefit — {fn_frac*100:.0f}% Thrust\n'
-                    'Red = VGT better  |  Blue = Fixed better',
-                    fontsize=10, fontweight='bold')
-        ax.legend(fontsize=9)
-        ax.grid(True, alpha=0.2, color='white')
-
-    fig_map.suptitle(
-        'VGT vs Fixed Turbine — Δη_th Contour Map\n'
-        'Physics dP/P  |  Optimal A4 scheduling for VGT',
-        fontsize=12, fontweight='bold')
-    plt.tight_layout()
-    plt.savefig('vgt_benefit_contour.png', dpi=150, bbox_inches='tight')
-    print('\n  Saved: vgt_benefit_contour.png')
-    plt.show()
-
-    # Save raw data
-    np.save('delta_eta_opr_tt4.npy', delta_eta)
-    np.save('OPR_vals.npy', OPR_vals)
-    np.save('Tt4_vals.npy', Tt4_vals)
-    print('  Saved: delta_eta_opr_tt4.npy')
+    

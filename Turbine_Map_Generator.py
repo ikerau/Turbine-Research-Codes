@@ -227,16 +227,16 @@ print("─" * 62)
 inlet = {"Pt": Pt0, "Tt": Tt0}
  
 # Speed lines: 70% to 110%
-speed_fracs = [1.00]#[0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00, 1.05, 1.10]
+speed_fracs = [0.70, 0.75, 0.80, 0.85, 0.90, 0.95, 1.00, 1.05, 1.10]
  
 # Area fractions — alphaMap dimension (NGV throat area scaling)
 # 1.0 = design geometry; < 1.0 = closed; > 1.0 = open
-area_fracs = [1.00]#[0.75, 0.80, 0.85, 0.90, 0.95, 1.00, 1.05, 1.10]
+area_fracs = [0.75, 0.80, 0.85, 0.90, 0.95, 1.00, 1.05, 1.10]
  
 # PR sweep using rotor exit static pressure
 PR_lo    = 1.2
 PR_hi    = perf['Pt_ratio'] * 2.0
-N_pts    = 100
+N_pts    = 25
  
 Ps3_des  = design['states']['Ps3']
 Pt3_des  = design['perf']['Pt3_abs']
