@@ -759,7 +759,7 @@ def _build_blade_geometry(
     Rm      = kin['Rm']
     mdot_kg = kin['mdot_kg']
     TE_m    = _mag(TE_radius, 'm')
-
+    inlet_wedge  = inlet_wedge  or Q_(15.0, 'deg')
     results = {}
 
     for row_name, is_rotor in [('stator', False), ('rotor', True)]:
@@ -885,6 +885,7 @@ def _build_blade_geometry(
                     'R_i_outlet': Q_(Ri_out,       'm'),
                     'R_o_inlet':  Q_(Ro_in,        'm'),
                     'R_i_inlet':  Q_(Ri_in,        'm'),
+                    'inlet_wedge': inlet_wedge,
                     'exit_wedge': exit_wedge,
                     'zeta_ung':   zeta_ung,
                     'TE_radius':  TE_radius,
@@ -1009,6 +1010,7 @@ def _build_blade_geometry(
             "R_o_outlet": Q_(Ro_out,                  'm'),
             "R_i_outlet": Q_(Ri_out,                  'm'),
             "rotating":   is_rotor,
+            "inlet_wedge": inlet_wedge,
             "exit_wedge": exit_wedge,
             "zeta_ung":   zeta_ung,
             # ── Diagnostics ──────────────────────────────────────────────
@@ -1221,6 +1223,11 @@ def forward_design(
     stator_blade = rotor_blade = None
     states = annulus = loss_s = loss_r = perf = None
     err    = 1e6
+    # Blade geometry (N, Cax, throat, pitch) is frozen after this many iters.
+    # The 2-cycle is driven by integer blade-count N flipping between two values
+    # as r_loss nudges the annulus; once the annulus is roughly set (iter 3-4)
+    # there is no physics reason to keep re-discretising.
+    GEOM_FREEZE_ITER = 4
 
     for outer in range(max_iter):
 
@@ -1228,42 +1235,34 @@ def forward_design(
         gas.TPX = _mag(kin['Tt0'], 'K'), _mag(kin['Pt0'], 'Pa'), composition
         states  = _walk_thermo(kin, gas, r_loss_s, r_loss_r)
 
-        # ── Annulus from isentropic states ────────────────────────────────
-        annulus = _size_annulus(kin, states, mdot_kg,
-                                stator_blade=stator_blade,
-                                rotor_blade=rotor_blade)
-
-
-        # ── Blade geometry ────────────────────────────────────────────────
-        stator_blade, rotor_blade = _build_blade_geometry(
-            kin, states, annulus,
-            AR_stator, AR_rotor, Z_stator, Z_rotor,
-            LE_radius, TE_radius,
-            inlet_wedge, exit_wedge_s, exit_wedge_r,
-            zeta_ung_s, zeta_ung_r, tip_gap, tip_gap_stator,
-            t_s_rotor, t_s_stator,
-            r_loss_s=r_loss_s, r_loss_r=r_loss_r,
-            build_pritchard=(err < tol or outer == max_iter - 1),
-        )
+        # ── Annulus + blade geometry (frozen after GEOM_FREEZE_ITER) ─────
+        if outer < GEOM_FREEZE_ITER:
+            annulus = _size_annulus(kin, states, mdot_kg,
+                                    stator_blade=stator_blade,
+                                    rotor_blade=rotor_blade)
+            stator_blade, rotor_blade = _build_blade_geometry(
+                kin, states, annulus,
+                AR_stator, AR_rotor, Z_stator, Z_rotor,
+                LE_radius, TE_radius,
+                inlet_wedge, exit_wedge_s, exit_wedge_r,
+                zeta_ung_s, zeta_ung_r, tip_gap, tip_gap_stator,
+                t_s_rotor, t_s_stator,
+                r_loss_s=r_loss_s, r_loss_r=r_loss_r,
+                build_pritchard=False,
+            )
 
         # ── Losses ────────────────────────────────────────────────────────
         s_in, s_out, r_in, r_out = _build_state_dicts(kin, states)
-        print(f"s_in W={float(s_in['W'].to('m/s').magnitude):.1f} "
-      f"s_out W={float(s_out['W'].to('m/s').magnitude):.1f} "
-      f"s_out lam={s_out['lam_exit']:.4f} "
-      f"s_out Ps={float(s_out['Ps'].to('Pa').magnitude):.0f}")
         loss_s = compute_blade_losses(stator_blade, s_in, s_out, gas, rpm=Q_(0, 'rpm'))
         loss_r = compute_blade_losses(rotor_blade,  r_in, r_out, gas, rpm=RPM)
 
         r_loss_s_new = float(loss_s['r_loss_new'])
         r_loss_r_new = float(loss_r['r_loss_new'])
 
-        alpha    = 0.3
-        r_loss_s = alpha * r_loss_s_new + (1.0 - alpha) * r_loss_s
-        r_loss_r = alpha * r_loss_r_new + (1.0 - alpha) * r_loss_r
-
         err = max(abs(r_loss_s_new - r_loss_s),
                   abs(r_loss_r_new - r_loss_r))
+        r_loss_r = r_loss_r_new
+        r_loss_s = r_loss_s_new
 
         # ── Efficiency ────────────────────────────────────────────────────
         perf = _compute_eta(kin, states, gas, composition=composition)
@@ -1280,8 +1279,23 @@ def forward_design(
             converged = True
             break
 
+    # Final Pritchard profile build at converged geometry
+    annulus = _size_annulus(kin, states, mdot_kg,
+                            stator_blade=stator_blade,
+                            rotor_blade=rotor_blade)
+    stator_blade, rotor_blade = _build_blade_geometry(
+        kin, states, annulus,
+        AR_stator, AR_rotor, Z_stator, Z_rotor,
+        LE_radius, TE_radius,
+        inlet_wedge, exit_wedge_s, exit_wedge_r,
+        zeta_ung_s, zeta_ung_r, tip_gap, tip_gap_stator,
+        t_s_rotor, t_s_stator,
+        r_loss_s=r_loss_s, r_loss_r=r_loss_r,
+        build_pritchard=True,
+    )
+
     if not converged and verbose:
-        print(f"  ⚠  forward_design did not converge in {max_iter} iterations (err={err:.2e})")
+        print(f"  forward_design did not converge in {max_iter} iterations (err={err:.2e})")
 
     perf.update(dict(
         r_loss_s = r_loss_s,

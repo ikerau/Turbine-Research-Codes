@@ -57,11 +57,13 @@ def turbine_power(mdot_kg, Tt4_K, OPR, comp_eff, gamma_c=1.4, gamma_t=1.33,
 
 
 # From pyCycle DESIGN solve (OPR=13.5, T4=2370°R)
-Tt4_K   = 2370.0 * 5.0 / 9.0          # K  = 1316.7 K
-Pt4_Pa  = 198.395 * 6894.757           # Pa = 1.368 MPa
-mdot_kg = 146.108 * 0.453592 * 1.668599           # kg/s = 66.3 kg/s
-pwr_W   = pwr_W = turbine_power(mdot_kg, Tt4_K, OPR=13.5, comp_eff=0.83)
-Nmech   = 8070.0                       # rpm
+# From pyCycle DESIGN solve (OPR=13.5, T4=2370°R)
+Tt4_K   = 1577.65          # K  = 1316.7 K
+Pt4_Pa  = 2325.15*1000
+mdot_kg = 53.935
+pwr_W   = turbine_power(mdot_kg = 52.84, Tt4_K = Tt4_K, OPR = 10.672, comp_eff = 0.867, gamma_c=1.4, gamma_t=1.33,
+                  R=287.05, Tt_inlet_K=288.15)
+Nmech   = 14460                    # rpm
 
 # =============================================================================
 #  STEP 2 — WORKING FLUID SETUP
@@ -95,7 +97,7 @@ print(f"    R     = {R_des:.3f} J/kg/K")
 # =============================================================================
 
 print("\n" + "─" * 62)
-print("  STEP 3: Design point kinematics  (ψ=1.25, φ=0.65)")
+print("  STEP 3: Design point kinematics  (ψ=1.00, φ=0.50)")
 print("─" * 62)
 
 Tt0  = Q_(Tt4_K,  'K')
@@ -112,8 +114,8 @@ kin = design_point_kinematics(
     gas  = gas,
     mdot = mdot,
     RPM  = RPM,
-    psi  = 1.325,
-    phi  = 0.60,
+    psi  = 1.164,
+    phi  = 0.536,
     W_t  = W_t,
 )
 
@@ -142,17 +144,17 @@ design = forward_design(
     AR_rotor     = 1.0,
     Z_stator     = 0.85,
     Z_rotor      = 0.80,
-    LE_radius    = Q_(3.0,   'mm'),
-    TE_radius    = Q_(1.5,   'mm'),
+    LE_radius    = Q_(0.005,   'in'),
+    TE_radius    = Q_(0.0025,   'in'),
     inlet_wedge  = Q_(15.0,  'deg'),
-    exit_wedge_s = Q_(5.0,   'deg'),
-    exit_wedge_r = Q_(5.0,   'deg'),
+    exit_wedge_s = Q_(3.0,   'deg'),
+    exit_wedge_r = Q_(3.0,   'deg'),
     zeta_ung_s   = Q_(6.5,   'deg'),
     zeta_ung_r   = Q_(6.5,   'deg'),
-    tip_gap      = Q_(0.030, 'cm'),
-    tip_gap_stator  = Q_(0.030, 'cm'),
+    t_s_rotor    = 0.005,
+    t_s_stator=    0.005,
     tol          = 1e-4,
-    max_iter     = 150,
+    max_iter     = 500,
     verbose      = True,
 )
 
@@ -188,16 +190,16 @@ design_fixed = forward_design(
     AR_rotor     = 1.0,
     Z_stator     = 0.85,
     Z_rotor      = 0.80,
-    LE_radius    = Q_(3.0,   'mm'),
-    TE_radius    = Q_(1.5,   'mm'),
+    LE_radius    = Q_(0.005,   'in'),
+    TE_radius    = Q_(0.0025,   'in'),
     inlet_wedge  = Q_(15.0,  'deg'),
-    exit_wedge_s = Q_(5.0,   'deg'),
-    exit_wedge_r = Q_(5.0,   'deg'),
+    exit_wedge_s = Q_(3.0,   'deg'),
+    exit_wedge_r = Q_(3.0,   'deg'),
     zeta_ung_s   = Q_(6.5,   'deg'),
     zeta_ung_r   = Q_(6.5,   'deg'),
-    tip_gap      = Q_(0.030, 'cm'),
+    t_s_rotor    = 0.005,
     tol          = 1e-4,
-    max_iter     = 150,
+    max_iter     = 500,
     verbose      = True,
 )
 

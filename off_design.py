@@ -143,55 +143,6 @@ def hydraulic_diam_blade(blade, gas):
     a2 = blade["Beta_1"]
     return 2 * pitch * inlet_blade_span * np.cos(a2) / (pitch * np.cos(a2) + inlet_blade_span)
 
-def penetration_depth_BSM(blade, inlet, delta_star_over_h=0.011):
-    """
-    BSM (2006) Part I Eq. 14.
-    Uses actual inlet flow angles from the converged flow state.
-    delta_star_over_h: inlet endwall boundary layer displacement
-                       thickness / span. Default 0.011 is the median
-                       value from BSM Part I Table 1. Sensitivity is
-                       low — the BL term contributes < 0.005 to ZTE/h
-                       for typical conditions.
-    """
-    bx  = float(blade["Chord_ax"].to('m').magnitude)
-    b   = bx / np.cos(blade["stagger"].to('rad').magnitude)
-    h   = float(blade["R_o_outlet"] - blade["R_i_outlet"])
-    Rm  = mean_radius(blade, outlet=True)
-    s   = float((2 * np.pi * Rm / blade["Blade_N"]).to('m').magnitude)
-
-    # ── Actual inlet flow angle (same logic as incidence_moustapha) ───────────
-    Cm = inlet["Cm"]
-    if "W_theta" in inlet:
-        W_theta  = float(inlet["W_theta"].to('m/s').magnitude)
-        Cm_val   = float(Cm.to('m/s').magnitude)
-        alpha_1  = np.arctan2(W_theta, Cm_val)
-    else:
-        W1       = inlet["W"]
-        Cm_val   = float(Cm.to('m/s').magnitude)
-        W1_val   = float(W1.to('m/s').magnitude)
-        C_theta  = np.sqrt(max(W1_val**2 - Cm_val**2, 0.0))
-        alpha_1  = np.arctan2(C_theta, Cm_val)
-
-    alpha_2 = float(blade["Beta_2"].to('rad').magnitude)   # exit metal angle
-
-    tan_1 = np.tan(alpha_1)
-    tan_2 = np.tan(alpha_2)
-    cos_1 = np.cos(alpha_1)
-    cos_2 = np.cos(alpha_2)
-
-    # ── BSM parameters ────────────────────────────────────────────────────────
-    tan_m = 0.5 * (tan_1 + tan_2)
-    cos_m = np.cos(np.arctan(tan_m))
-
-    CR  = cos_1 / cos_2
-    Ft  = (2.0 * s / bx) * (cos_m ** 2) * (tan_1 + tan_2)
-    h_C = h / b
-
-    ZTE_over_h = (0.10 * Ft ** 0.79 /
-                  (np.sqrt(max(CR, 1e-6)) * h_C ** 0.55)
-                  + 32.70 * delta_star_over_h ** 2)
-
-    return float(np.clip(ZTE_over_h, 0.0, 0.5))
 
 def profile_loss(W1, W2, blade, mu, rho, gamma, M1_mean, M2_mean, Ps1, Ps2, inlet, outlet):
     zeta_s = base_profile_loss(W2, M2_mean, gamma, blade, inlet,
@@ -203,6 +154,7 @@ def profile_loss(W1, W2, blade, mu, rho, gamma, M1_mean, M2_mean, Ps1, Ps2, inle
     # ── Hub inlet Mach — free vortex scaling ──────────────────────────────────
     Rm       = float(mean_radius(blade, outlet=False).to('m').magnitude)
     R_hub    = float(blade["R_i_inlet"].to('m').magnitude)
+    R_tip    = float(blade["R_o_inlet"].to('m').magnitude)
     W1_ax    = W1_mag * float(np.cos(blade["Beta_1"].to('rad').magnitude))
     W1_theta = W1_mag * float(np.sin(blade["Beta_1"].to('rad').magnitude))
     W1_theta_hub = W1_theta * Rm / R_hub
@@ -211,7 +163,7 @@ def profile_loss(W1, W2, blade, mu, rho, gamma, M1_mean, M2_mean, Ps1, Ps2, inle
     M1_hub   = (W1_hub / a_in)
     zeta_shock_2 = 0
     if M1_hub > 0.4:
-        zeta_shock_1 = 0.75*(M1_hub - 0.4)**1.75
+        zeta_shock_1 = 0.75*(M1_hub - 0.4)**1.75 * (R_hub / R_tip)  # KO Eq. 5: radial averaging
         term1 = 1 - (1 + ((gamma - 1)/2)*M1_mean**2)**(gamma/(gamma - 1))
         term2 = 1 - (1 + ((gamma - 1)/2)*M2_mean**2)**(gamma/(gamma - 1))
         zeta_shock_2 = zeta_shock_1*(Ps1/Ps2)*(term1/term2)
@@ -384,6 +336,7 @@ def absolute_to_relative_velocity(flow, blade, rpm=Q_(150000,'rpm')):
 
 def incidence_moustapha(inlet, blade, M1, M2, zeta_s, gamma):
     Cm = inlet["Cm"]
+    We = blade["inlet_wedge"].to('deg').magnitude
 
     if "W_theta" in inlet:
         # Rotor: signed relative flow angle via arctan2
@@ -413,16 +366,64 @@ def incidence_moustapha(inlet, blade, M1, M2, zeta_s, gamma):
     pitch = (2 * np.pi * Rm) / blade["Blade_N"] 
     d_s   = (2 * blade["LE_radius"] / pitch).to('').magnitude
 
-    X = (d_s**-1.6) * ((cosb1/cosb2)**-2) * i
+    X = (d_s**-0.05) * (We**-0.2) * ((cosb1/cosb2)**-1.4) * i
     
     
-    if X > 0:
-        dphi2 = (0.778e-5*X + 0.56e-7*X**2
-                 + 0.4e-10*X**3 + 2.054e-19*X**6)
+    if X >= 0:
+        a1 = -6.149*10**-5
+        a2 =  1.327*10**-3
+        a3 = -2.506*10**-4
+        a4 = -1.542*10**-4
+        a5 =  9.017*10**-5
+        a6 =  1.106*10**-5
+        a7 = -5.318*10**-6
+        a8 =  3.711*10**-7
+        dphi2 = a8 * X**8 + a7*X**7 + a6*X**6 + a5*X**5 + a4*X**4 + a3*X**3 + a2*X**2 + a1*X
     elif X < 0:
-        dphi2 = (-5.1734e-6*X + 7.6902e-9*X**2)
+        a2 =  1.358*10**-4
+        a1 = -8.720*10**-4
+        dphi2 = a2*X**2 + a1*X
 
     return float(zeta_s + dphi2)
+
+
+def secondary_incidence_moustapha(inlet, blade):
+    """
+    """
+    Cm = inlet["Cm"]
+    Cm_val = float(Cm.to('m/s').magnitude)
+
+    if "W_theta" in inlet:
+        W_theta = float(inlet["W_theta"].to('m/s').magnitude)
+        alpha_1 = np.degrees(np.arctan2(W_theta, Cm_val))
+    else:
+        W1_val  = float(inlet["W"].to('m/s').magnitude)
+        C_theta = np.sqrt(max(W1_val**2 - Cm_val**2, 0.0))
+        alpha_1 = np.degrees(np.arctan2(C_theta, Cm_val))
+
+    beta1 = float(blade["Beta_1"].to('deg').magnitude)
+    beta2 = float(blade["Beta_2"].to('deg').magnitude)
+    cosb1 = np.cos(np.radians(beta1))
+    cosb2 = np.cos(np.radians(beta2))
+
+    d     = 2.0 * float(blade["LE_radius"].to('m').magnitude)
+    c     = float(blade["Chord_ax"].to('m').magnitude)
+
+    chi_dbl = ((alpha_1 - beta2) / (beta1 + beta2)
+               * (cosb1 / cosb2) ** (-1.5)
+               * (d / c) ** (-0.3))
+
+    if 0.0 < chi_dbl <= 0.3:
+        ratio = (np.exp(0.9 * chi_dbl)
+                 + 13.0 * chi_dbl**2
+                 + 400.0 * chi_dbl**4)
+    elif -0.1 <= chi_dbl < 0.0:
+        ratio = np.exp(0.9 * chi_dbl)
+    else:
+        ratio = 1.0   # outside Moustapha validity range — no correction
+
+    return float(ratio)
+
 
 def arc_length(blade):
     b2 = blade["Beta_2"].to('rad').magnitude
@@ -518,7 +519,129 @@ def base_profile_loss(W2, M2_mean, gamma, blade, inlet,
     zeta_final = Yp_tot * ((1 + (gamma-1)/2 * M2_mean**2)**(gamma/(gamma-1)) - 1) / (gamma/2 * M2_mean**2)
     
     return zeta_final
-    
+
+def coull_secondary(W1, W2, rho_ratio, blade, inlet, Cd=0.002, X_us=0.5, X_ds=0.5, Tmax_Cx=0.10,
+                    DF=0.28, Speak_over_S0=0.52, LEI=0.45):
+    Cax   = float(blade["Chord_ax"].to('m').magnitude)
+    Rm    = float(mean_radius(blade, outlet=True).to('m').magnitude)
+    pitch = 2.0 * np.pi * Rm / blade["Blade_N"]
+    Cm    = inlet["Cm"].to('m/s')
+    if "W_theta" in inlet:
+        W_theta = float(inlet["W_theta"].to('m/s').magnitude)
+        Cm_val  = float(Cm.to('m/s').magnitude)
+        alpha_1 = np.arctan2(W_theta, Cm_val)
+    else:
+        W1_loc  = inlet["W"]
+        Cm_val  = float(Cm.to('m/s').magnitude)
+        W1_val  = float(W1_loc.to('m/s').magnitude)
+        C_theta = np.sqrt(max(W1_val**2 - Cm_val**2, 0.0))
+        alpha_1 = np.arctan2(C_theta, Cm_val)
+    alpha_2     = blade["Beta_2"].to('rad').magnitude
+    V1_V2       = (W1 / W2).to('').magnitude
+    XUS_Cx      = X_us
+    XDS_Cx      = X_ds
+    span        = (blade["R_o_outlet"] - blade["R_i_outlet"]).to('m').magnitude
+    Cx_hcosa2 = Cax / (span * np.cos(alpha_2))   # Cx/(h·cos α₂), paper Eqs. (7) and (8)
+    Cx_pcosa2 = Cax / (pitch * np.cos(alpha_2))
+    Cx_h      = Cax / span
+
+    # Wetted Area Loss — paper Eqs. (7), (8), (9)
+    zeta_US   = 4 * Cd * Cx_hcosa2 * V1_V2**3 * XUS_Cx
+    zeta_DS   = 4 * Cd * Cx_hcosa2 * XDS_Cx
+    zeta_pass = 4.363 * Cd * Cx_h
+    zeta_wet  = zeta_US + zeta_DS + zeta_pass
+
+    # Coull secondary model requires V1 < V2 (accelerating passage)
+    if V1_V2 >= 1.0:
+        return zeta_wet
+
+    # Secondary Flow: Mixing-Induced Loss
+    V_star    = 1 - np.sqrt(1 - V1_V2**2)
+    dT_star   = transit_time_integral(W1, W2, blade, DF=DF, Speak_over_S0=Speak_over_S0, LEI=LEI)
+    Gamma_sec = (V_star * dT_star * Cx_pcosa2
+                 + np.abs(V1_V2 * np.sin(alpha_1) / np.cos(alpha_2)
+                          - V_star * np.tan(alpha_2)))
+    zeta_secmix = 2 * (pitch * np.cos(alpha_2) / span) * 0.01442 * Gamma_sec
+
+    # Secondary Flow: Secondary Kinetic Energy (PI_SKE, Coull GT2025 coefficients)
+    H12     = 1.4
+    H12_lim = 1.23
+    H_eff   = max(H12, H12_lim)
+    disp_th_Cx  = 0.05
+    CF = (1 + min(2.62, H12)) * (1 / V1_V2 - 1) * (np.cos(alpha_2) / np.cos(alpha_1))
+    CF = min(max(CF, 0), 5)
+    disp_th_Eff = disp_th_Cx * np.exp(-0.345 * CF)
+    D      = disp_th_Eff / (pitch * np.cos(alpha_2))
+    term   = D**((0.170 / (H_eff - 1)) + 0.593)
+    PI_SKE = (0.0102 * (H_eff - 1) * term) / (D**1.636 + 0.0986 * (H_eff - 1) - 0.119)
+    zeta_SKE = 2 * (pitch * np.cos(alpha_2) / span) * Gamma_sec**2 * PI_SKE
+
+    return zeta_wet + zeta_secmix + zeta_SKE
+
+
+def coull_transit_time(alpha_1, alpha_2, pitch, Cax, rho_ratio, Tmax_Cx=0.10):
+    T_max  = Tmax_Cx * Cax
+    V2_Vss = 0.98   # Table 3 constant (Coull GT2025-151998)
+
+    S0_ps_Cx = 0.4267 / np.cos(alpha_2) + 0.5086
+    S0_Ss_Cx = 0.5024 / np.cos(alpha_2) + 0.5202
+
+    # Method 1
+    Rps_Cax = 1.0 / np.abs(np.sin(alpha_1) - np.sin(alpha_2))
+    Rps     = Rps_Cax * Cax
+    Rss_Cax = Rps_Cax - (pitch - T_max) / Cax
+    term1   = 0.352 * (np.cos(alpha_2) + 1.864 * np.maximum(Rss_Cax, -1.5) - 3.10)**2
+    Vps_V2  = np.minimum(np.maximum((pitch / Rps) / term1, 0.05), 0.9)
+    V2_Vps  = 0.9641 * Vps_V2**-1 + 0.01974 * Vps_V2**-4.1106
+    dT_star_M1 = S0_ps_Cx * V2_Vps - S0_Ss_Cx * V2_Vss
+
+    # Method 2
+    Rss_Cax = 0.7 / np.abs(np.sin(alpha_2))
+    Rss     = Rss_Cax * Cax
+    Rps_Cax = Rss_Cax + (pitch - T_max) / Cax
+    Rps     = Rps_Cax * Cax                        # updated for Method 2
+    Vps_V2_m2 = pitch * np.cos(alpha_2) / (Rps * np.log(Rps / Rss))
+    Y       = (1.075 - 0.109 / np.cos(alpha_2)) / Vps_V2_m2
+    T_m2    = rho_ratio * (Y + 0.0226 * Y**4.434)
+    dT_star_M2 = np.maximum(0, T_m2 - S0_Ss_Cx * V2_Vss)
+
+    # Aggregate
+    dT12 = 0.5 * (dT_star_M1 + dT_star_M2)
+    err  = np.abs(dT_star_M2 - dT_star_M1) / dT_star_M2
+    if err < 0.29:
+        return dT_star_M2
+    elif err <= 0.31:
+        return dT_star_M2 + (dT12 - dT_star_M2) * (err - 0.29) / 0.02
+    else:
+        return dT12
+
+
+def transit_time_integral(W1, W2, blade,
+                          DF=0.28, Speak_over_S0=0.52, LEI=0.45, n_integ=120):
+    """Direct Eq. (15) integral: dT* = T*_PS - T*_SS = ∮ (V2/V) d(S/Cx).
+    Uses the same suction_profile helper as marsh_zeta; avoids correlated
+    Methods 1 & 2 and the blending discontinuity in coull_transit_time."""
+    Cax   = float(blade["Chord_ax"].to('m').magnitude)
+    W2mag = float(W2.to('m/s').magnitude)
+    W1mag = float(W1.to('m/s').magnitude)
+
+    # Suction surface
+    S0_SS   = float(arc_length(blade).to('m').magnitude)
+    S_parts, U_parts = suction_profile(W2mag, blade, DF=DF,
+                                       Speak_over_S0=Speak_over_S0, LEI=LEI)
+    S_ss = np.concatenate([S_parts[0], S_parts[1]])[1:]
+    V_ss = np.concatenate([U_parts[0], U_parts[1]])[1:]
+    T_star_SS = np.trapezoid(W2mag / V_ss, S_ss / Cax)
+
+    # Pressure surface: constant at W1 (same approximation as marsh_zeta)
+    S0_PS = S0_SS * 0.86
+    z_ps  = np.linspace(0.0, S0_PS / Cax, n_integ)
+    T_star_PS = np.trapezoid(np.full(n_integ, W2mag / W1mag), z_ps)
+
+    dT_star = T_star_PS - T_star_SS
+    return min(dT_star, 12.0)                # §A.3 limiter
+
+
 def marsh_zeta(W1, W2, M1_mean, gamma, blade, inlet,
                Cd=0.002, n_integ=120, DF=0.28, Speak_over_S0=0.52, LEI=0.45):
     """
@@ -856,22 +979,27 @@ def deviation(blade, lam, lam_crit):
     beta_g_circ = np.degrees(np.arcsin(sinb))
 
     arg    = sinb * (1.0 + (1.0 - sinb) * (beta_g_circ / 90.0)**2)
-    arg    = float(np.clip(arg, -1.0, 1.0))
     delta_0 = np.degrees(np.arcsin(arg)) - beta_g_circ
 
     # Smoothstep from lam=0.5·lam_crit to lam_crit
+    
     lam_ratio = lam / lam_crit if lam_crit > 0 else 0.0
     if lam_ratio <= 0.5:
         delta = delta_0
     elif lam_ratio <= 1.0:
         X     = 2.0 * lam_ratio - 1.0   # 0 to 1 as lam goes 0.5·lam_crit to lam_crit
         delta = delta_0 * (1.0 - 10*X**3 + 15*X**4 - 6*X**5)
-    
+    else:
+        delta = 0.0   # lam slightly above lam_crit due to numerics — use choke value
+
     beta_g_axial = np.degrees(np.arcsin(float(o / t)))
-    
+
     alpha_out = beta_g_axial + delta
     alpha_out = 90 - alpha_out
-    
+
+    # Cap at the metal blade angle — flow cannot exceed blade exit angle in subsonic flow
+    beta2_metal = float(blade["Beta_2"].to('deg').magnitude)
+
     return Q_(alpha_out, 'deg')
 
 def mdot_out(A, Pt, Tt, lam_c, n_poly, gamma, R):
@@ -1013,14 +1141,18 @@ def blade_passage_new(blade, input, gas, P_out, r_loss, rpm=Q_(0,'rpm'), mdot_ch
     Cm_out = W2_mag * cos_a
 
     # ── Absolute frame ────────────────────────────────────────────────────
+    # Beta_2 is stored as a positive magnitude; for a turbine rotor the relative
+    # exit tangential velocity is in the OPPOSITE direction to blade motion, so
+    # W_theta_rel is negative.  C_theta = W_theta + U vectorially.
     if blade["rotating"]:
-        W_theta_rel = Cm_out * tan_a
-        C_theta_abs = W_theta_rel - U_mag
+        W_theta_rel = -Cm_out * tan_a
+        C_theta_abs = W_theta_rel + U_mag
         C2          = np.sqrt(Cm_out**2 + C_theta_abs**2)
         Tt_abs_mag  = T_out_mag + 0.5 * C2**2 / Cp_out
         a_crit_abs  = float(a_crit(R_out, Q_(Tt_abs_mag, 'K'),
                                    gamma_out).to('m/s').magnitude)
         lam_abs     = C2 / a_crit_abs
+        M_abs_val   = lambda_to_mach(lam_abs, gamma_out)
         Pt_abs_mag  = P_out_mag / isentropic_p_P0(lam_abs, gamma_out)
         gas.TP      = T_out_mag, P_out_mag
         rho_out     = float(gas.density)
@@ -1033,6 +1165,7 @@ def blade_passage_new(blade, input, gas, P_out, r_loss, rpm=Q_(0,'rpm'), mdot_ch
         Tt_abs_mag = Tt_mag
         Pt_abs_mag = Pt_out_mag
         C2         = W2_mag
+        M_abs_val  = M_w2   # absolute = relative for stationary blade
         gas.TP     = T_out_mag, P_out_mag
         rho_out    = float(gas.density)
         hs_out     = Q_(gas.enthalpy_mass, 'J/kg')
@@ -1063,6 +1196,7 @@ def blade_passage_new(blade, input, gas, P_out, r_loss, rpm=Q_(0,'rpm'), mdot_ch
         "hs":       hs_out,
         "lam_exit": lam_out,
         "M_exit":   M_w2,
+        "M_abs":    M_abs_val,
         "lam_crit": lam_crit,
         "choked":   choked,
         "alpha_out": alpha_out,
@@ -1127,6 +1261,7 @@ def compute_blade_losses(blade, inlet, outlet, gas, rpm=Q_(150000,'rpm')):
     # ── Unpack inlet ──────────────────────────────────────────────────────
     Pt_in  = inlet["Pt_rel"]
     Tt_in  = inlet["Tt_rel"]
+    
     gamma  = inlet["gamma"]
     R      = inlet["R"]
     W1     = inlet["W"]
@@ -1143,6 +1278,10 @@ def compute_blade_losses(blade, inlet, outlet, gas, rpm=Q_(150000,'rpm')):
     M_w1   = lambda_to_mach(lam_w1, gamma)
     Ts1    = Tt_in * isentropic_t_T0(lam_w1, gamma)
     Ps1    = Pt_in * isentropic_p_P0(lam_w1, gamma)
+    
+    # ── Inlet static state for loss models ───────────────────────────────
+    gas.TP    = float(Ts1.to('K').magnitude), float(Ps1.to('Pa').magnitude)
+    rho_in   = Q_(gas.density,   'kg/m^3')
 
     # ── Outlet static state for loss models ───────────────────────────────
     gas.TP    = float(Ts2.to('K').magnitude), float(Ps2.to('Pa').magnitude)
@@ -1167,37 +1306,10 @@ def compute_blade_losses(blade, inlet, outlet, gas, rpm=Q_(150000,'rpm')):
     zeta_w = 0.0
 
 
-    # ── Endwall loss (Coull 2017) ────────────
-    M_w1_scalar = float(M_w1)
-    M_w2_scalar = float(M_w2)
-    g_out       = float(gamma_out)
-
-    zeta_secondary = marsh_zeta(
-        W1, W2,
-        M1_mean = M_w1_scalar,
-        gamma   = g_out,          # use gamma_out, not inlet gamma
-        blade   = blade,
-        inlet   = inlet,
-    )
-
-    zeta_boundary = cd_zeta(
-        W1, W2,
-        M1_mean = M_w1_scalar,
-        M2_mean = M_w2_scalar,
-        gamma   = g_out,
-        blade   = blade,
-        inlet   = inlet,
-    )
-
-    Cax_m = float(blade["Chord_ax"].to('m').magnitude)
-    h_m   = float((blade["R_o_outlet"] - blade["R_i_outlet"]
-                - blade["Tip_Gap"]).to('m').magnitude)
-    AR_design = 3.0          # Coull calibration aspect ratio
-    AR_machine = h_m / Cax_m # your machine's aspect ratio
-    AR_correction = AR_design / AR_machine  # = 3/AR_machine
-
-    zeta_f = (zeta_secondary + zeta_boundary) * AR_correction
-    #print(f"zeta_boundary={zeta_boundary:.4f}  xi_sec={zeta_secondary:.4f}  AR_corr={AR_correction:.2f}")
+    # ── Endwall loss (Coull 2025) + Moustapha secondary incidence correction ──
+    rho_ratio = (rho_in / rho_out).to('').magnitude
+    zeta_f = coull_secondary(W1, W2, rho_ratio, blade, inlet)
+    zeta_f *= secondary_incidence_moustapha(inlet, blade)
 
     # ── Leakage loss ──────────────────────────────────────────────────────
     if blade["Tip_Gap"] > Q_(0, 'mm'):
@@ -1537,7 +1649,23 @@ def build_performance_curve_moffitt(stator, rotor, inlet, gas,
                     return 1e6
 
             # ── Solve — fsolve warm-started from previous p1 ─────────────────
-            if choke_mode == "rotor" or choke_mode == "both":
+            if (choke_mode == "rotor" or choke_mode == "both") and mdot_frozen is not None:
+                # Rotor choked: stator must also pass exactly mdot_frozen.
+                # Solve for p1 that gives stator ms = mdot_frozen.
+                def stator_choked_residual(p1_mag):
+                    p1_mag = float(np.asarray(p1_mag).flat[0])
+                    try:
+                        p1_q = Q_(float(p1_mag), 'Pa')
+                        s_out_ = blade_passage_new(stator, stator_inlet, gas,
+                                                   p1_q, r_loss_s, rpm=Q_(0,'rpm'),
+                                                   mdot_choke=Q_(mdot_frozen,'kg/s'))
+                        ms = float(s_out_["mdot"].to('kg/s').magnitude)
+                        return ms - mdot_frozen
+                    except Exception:
+                        return 1e6
+                p1_sol = float(fsolve(stator_choked_residual, p1_prev,
+                                      full_output=False)[0])
+            elif choke_mode == "rotor" or choke_mode == "both":
                 p1_sol = p1_prev
             else:
                 p1_sol = float(fsolve(mass_flow_residual, p1_prev,
@@ -1669,19 +1797,29 @@ def build_performance_curve_moffitt(stator, rotor, inlet, gas,
                   f"  p1={float(p1.to('Pa').magnitude)/1000:.1f}kPa"
                   f"  ms - mr={mdot_s_raw - mdot_r_raw:.3f}")
 
+            Ps_rin  = float(r_inlet["Ps"].to('Pa').magnitude)
+            Ps_rout = float(r_out["Ps"].to('Pa').magnitude)
+            Pt_rin  = float(r_inlet["Pt_rel"].to('Pa').magnitude)
+
             curve.append({
-                "PR":           PR,
-                "mdot":         mdot_final,
-                "eta":          eta,
-                "alpha_exit":   alpha_exit,
-                "choke":        choke_mode,
-                "first_choke":  first_choke,
-                "loss_s":       loss_s,
-                "loss_r":       loss_r,
-                "stator_inlet": stator_inlet,
-                "stator_out":   s_out,
-                "rotor_in":     r_inlet,
-                "rotor_out":    r_out,
+                "PR":              PR,
+                "mdot":            mdot_final,
+                "eta":             eta,
+                "alpha_exit":      alpha_exit,
+                "choke":           choke_mode,
+                "first_choke":     first_choke,
+                "loss_s":          loss_s,
+                "loss_r":          loss_r,
+                "stator_inlet":    stator_inlet,
+                "stator_out":      s_out,
+                "rotor_in":        r_inlet,
+                "rotor_out":       r_out,
+                "M_stator_exit":   M_EXITS,
+                "M_rotor_exit":    M_EXITR,
+                "i_rotor":         i_rotor,
+                "Ps_rotor_in":     Ps_rin,
+                "Ps_rotor_out":    Ps_rout,
+                "Pt_rotor_in":     Pt_rin,
             })
         else:
             PR_skip = Pt_mag / p2_mag
@@ -1780,14 +1918,14 @@ def extract_throat(
     print(f"Throat point PS: ({pt_ps[0]:.4f}, {pt_ps[1]:.4f})")
     print(f"Throat distance: {throat_in:.4f} in = {throat_mm:.4f} mm")
  
-    print(f"{'─'*52}")
+    print(f"{'-'*52}")
     print(f"  {title}")
     print(f"  Circumferential pitch : {pitch_circ_in*25.4:.3f} mm")
     print(f"  Geometric throat      : {throat_mm:.4f} mm  ({throat_in:.5f} in)")
     if pt_ss is not None:
         print(f"  Throat SS (local)     : X={pt_ss[0]:.4f} in, Y={pt_ss[1]:.4f} in")
         print(f"  Throat PS (local)     : X={pt_ps[0]:.4f} in, Y={pt_ps[1]:.4f} in")
-    print(f"{'─'*52}")
+    print(f"{'-'*52}")
  
     if plot:
         # Rotate to machine frame for plotting only
@@ -1844,9 +1982,13 @@ def rotate_stator(raw, theta_deg, phi_deg_design, Rm_in, N_blades,
         YU_rot = X_rel * np.sin(theta) + YU_rel * np.cos(theta) + Y_pivot
 
         raw_rot = np.column_stack([X_rot, YL_rot, YU_rot])
-        phi_new = phi_deg_design + theta_deg
+        # Negative theta_deg closes the blade (toward tangential); Beta_2 and
+        # phi both use the same convention: subtract theta_deg so that closing
+        # (theta < 0) increases Beta_2 and phi (more tangential) — matching
+        # the paper's description of 7.79° toward tangential for 70% area.
+        phi_new = phi_deg_design - theta_deg
 
-        phi_rad = np.radians(phi_deg_design)
+        phi_rad = np.radians(phi_deg_design)   # design phi for blade-local pitch offset
         pitch   = 2.0 * np.pi * Rm_in / N_blades
         plX     = -pitch * np.sin(phi_rad)
         plY     =  pitch * np.cos(phi_rad)
@@ -1934,6 +2076,7 @@ if __name__ == "__main__":
         "R_o_outlet": Q_(R_o,             'm'),
         "R_i_outlet": Q_(R_i,             'm'),
         "exit_wedge": Q_(3.0,             'deg'),
+        "inlet_wedge": Q_(15,             'deg'),
         "zeta_ung":   Q_(6.5,             'deg'),
         "rotating":   False,
     }
@@ -1953,6 +2096,7 @@ if __name__ == "__main__":
         "R_o_outlet": Q_(R_o,             'm'),
         "R_i_outlet": Q_(R_i,             'm'),
         "exit_wedge": Q_(3.0,             'deg'),
+        "inlet_wedge": Q_(15,             'deg'),
         "zeta_ung":   Q_(6.5,             'deg'),
         "rotating":   True,
     }
@@ -2019,6 +2163,7 @@ if __name__ == "__main__":
             "R_i_inlet":  Q_(R_i,                 'm'),
             "R_o_outlet": Q_(R_o,                 'm'),
             "R_i_outlet": Q_(R_i,                 'm'),
+            "inlet_wedge": Q_(15,             'deg'),
             "exit_wedge": Q_(3.0,                 'deg'),
             "zeta_ung":   Q_(6.5,                 'deg'),
             "rotating":   False,
