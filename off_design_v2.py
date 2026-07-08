@@ -702,7 +702,6 @@ def deviation(blade, lam, lam_crit, gamma):
     t     = float(((2 * np.pi * Rm) / blade["Blade_N"]).to('m').magnitude)
     o     = float(blade["throat"].to('m').magnitude)
 
-
     sinb   = float(np.clip(o / t, 0.0, 1.0))
     beta_g_circ = np.degrees(np.arcsin(sinb))
 
@@ -710,9 +709,9 @@ def deviation(blade, lam, lam_crit, gamma):
     delta_0 = np.degrees(np.arcsin(arg)) - beta_g_circ
 
     # Smoothstep on Ma from 0.5 to 1.0 (Eq. B2), not lam/lam_crit.
-    Ml = lambda_to_mach(lam, gamma)
-    Mc = lambda_to_mach(lam_crit, gamma)
-    Ma = Ml/Mc
+    Ma = lambda_to_mach(lam, gamma)
+    
+    #Mc = lambda_to_mach(lam_crit, gamma)
     if Ma <= 0.5:
         delta = delta_0
     elif Ma <= 1.0:
@@ -806,7 +805,17 @@ def blade_passage_new(blade, input, gas, P_out, r_loss, rpm=Q_(0,'rpm'), mdot_ch
     R_out_mag = Rmag
 
     for _ in range(30):
-
+        # n_poly and gp1_gm1 BOTH reference the INLET gamma (fixed, not
+        # gamma_out): n_poly characterizes entropy generation relative to
+        # the inlet reference state, and using the same inlet gamma in
+        # gp1_gm1 keeps lam_out a closed-form function of fixed inlet gas
+        # properties + the given pressures -- no dependence on the
+        # not-yet-converged gamma_out at all, so no circularity (mixing in
+        # gamma_out here previously broke mass-flow convergence once both
+        # rows choke). gamma_out is still iterated below, but only feeds
+        # LOCAL/exit-state conversions (T_out_mag, Cp_out, rho_out, Mach),
+        # matching forward_design.py's _build_blade_geometry, which uses the
+        # same inlet/exit split for n_poly vs local-state gamma.
         gp1_gm1 = (gamma + 1.0) / (gamma - 1.0)
 
         Pt_in_over_Ps  = Pt_mag     / P_out_mag
@@ -842,7 +851,17 @@ def blade_passage_new(blade, input, gas, P_out, r_loss, rpm=Q_(0,'rpm'), mdot_ch
     rho_out = float(gas.density)
 
     # ── Choke detection ─────────────────────────────────────────────────────
-
+    # lam_out is already a polytropic (loss-referenced) quantity, not an
+    # isentropic one -- everything about the actual exit state (Ts, Ps, W2)
+    # is built from n_poly. Comparing it against an isentropic-only threshold
+    # (n=gamma) compares two different reference frames and produced a real
+    # ~5% mass-flow discontinuity at the choke transition on the TP1680
+    # sweep (confirmed). lam_crit_polytropic(n_poly, gamma) is the correct,
+    # continuous threshold: it's the peak of the SAME mass-flow function
+    # (parameterized by the SAME n_poly) that lam_out/deviation() already use
+    # on the unchoked side, so choking and the unchoked branch stay in the
+    # same reference frame by construction. See sup_deviation() for how mass
+    # continuity is enforced once choked.
     lam_crit = lam_crit_polytropic(n_poly, gamma)
     choked   = lam_out >= lam_crit
 
@@ -902,7 +921,7 @@ def blade_passage_new(blade, input, gas, P_out, r_loss, rpm=Q_(0,'rpm'), mdot_ch
     # ── Mass flow ─────────────────────────────────────────────────────────
     A_exit  = float(axial_exit_area_nb(blade).to('m**2').magnitude)
     mdot = mdot_out(A_exit * cos_a, Pt_mag, Tt_mag, lam_out, n_poly, gamma, Rmag)
-    
+
     return {
         "Pt_rel":   Q_(Pt_out_mag, 'Pa'),
         "Tt_rel":   Q_(Tt_mag,     'K'),
@@ -1432,6 +1451,14 @@ def build_performance_curve_moffitt(stator, rotor, inlet, gas,
                 choke_mode = "rotor"
             else:
                 choke_mode = "none"
+
+            if os.environ.get('DEBUG_PEAK') and 10 <= p2_idx <= 20:
+                print(f"    [DBG idx={p2_idx} iter={loss_iter}] p1_sol={p1_sol_clipped:.3f} "
+                      f"r_loss_s={r_loss_s:.6f} r_loss_r={r_loss_r:.6f} "
+                      f"ms={float(s_out['mdot'].to('kg/s').magnitude):.6f} "
+                      f"mr={float(r_out['mdot'].to('kg/s').magnitude):.6f} "
+                      f"s_choked={s_choked} r_choked={r_choked} choke_mode={choke_mode} err={err:.3e}")
+
             err_prev     = err
             # ── Update stator inlet ───────────────────────────────────────────
             if choke_mode == "rotor" or choke_mode == "both":
@@ -1517,6 +1544,7 @@ def build_performance_curve_moffitt(stator, rotor, inlet, gas,
                   f"  choke={choke_mode}"
                   f"  1st={first_choke}"
                   f"  alpha_s={s_out["alpha_out"]:4f}°"
+                  f"  Mach_stator={M_EXITS:.3f}"
                   f"  p1={float(p1.to('Pa').magnitude)/1000:.1f}kPa"
                   f"  ms - mr={mdot_s_raw - mdot_r_raw:.3f}")
 
@@ -1746,7 +1774,7 @@ if __name__ == "__main__":
     Dm    = Q_(46.99, 'cm').to('m').magnitude
     b     = Q_(3.81,  'cm').to('m').magnitude
     Rm    = Dm / 2                                      # RMS mean radius
-    R_i   = Rm - b/2#(-b + np.sqrt(4*Rm**2 - b**2)) / 2         # solve (Ro²+Ri²)/2=Rm², Ro-Ri=b
+    R_i   = Rm - b/2#(-b + np.sqrt(4*Rm**2 - b**2)) / 2          # solve (Ro²+Ri²)/2=Rm², Ro-Ri=b
     R_o   = R_i + b
     Rm_in = (Dm * 100 / 2) / 2.54
 

@@ -1,36 +1,34 @@
 """
-thermal_efficiency_scenarios.py
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+thermal_efficiency_scenarios.py  —  turboshaft A4 sweep
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Three scenarios comparing thermal efficiency vs A₄ scalar:
-  1. Zero cooling, fixed turbine
-  2. Gauntner-sized cooling, VGT turbine
-  3. Zero cooling, VGT turbine
+η_th, PSFC, T₄, and T_metal vs A₄ scalar for a simple turboshaft cycle.
+Two scenarios (Fixed map vs VGT map) are solved across a grid of
+(power fraction × A4 scalar).  Brent optimisation is NOT used — the full
+efficiency landscape is exposed so the optimal schedule can be read off directly.
+
+Warm-start strategy (mirrors combustor_turboshaft.py):
+  Power axis  — high→low; each level seeds the next.
+  A4 axis     — sorted by |a4-1.0| (design anchor first); walks outward.
+  Cross-axis  — prev_at_a4[a4] carries the converged result from the
+                previous power level at the same a4, giving a 2-D warm grid.
 
 Outputs
 -------
-  thermal_efficiency_scenarios.pkl
-  thermal_efficiency_scenarios.png  — η_th vs A₄
-  gauntner_cooling_prescription.png — cooling fraction vs A₄
-  blade_life_scenarios.png          — T_metal and LMP life ratio vs A₄
-
-Shared physics (combustor model, cooling sizing, extraction, LMP) is in
-combustor_py_cycle.py and imported here to avoid duplication.  The local
-cycle model uses fixed cooling fracs (cycle params) so Scenarios 1 and 3
-can set them to zero — the dynamic CoolingCalcs model in combustor_py_cycle
-cannot represent zero-cooling conditions.
+  ts_eta_th_vs_a4.png
+  ts_psfc_vs_a4.png
+  ts_temperatures_vs_a4.png
+  ts_a4_schedule.png
 """
 
 import time
+import os
 import warnings
-warnings.filterwarnings("ignore")
+warnings.filterwarnings('ignore')
 
 import numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.lines import Line2D
-import pint
-import pickle
-import os
+import matplotlib.cm as cm
 
 import openmdao.api as om
 import pycycle.api as pyc
@@ -38,376 +36,439 @@ import pycycle.api as pyc
 from EngineHPT_map       import EngineHPTMap as EngineHPTVGTMap
 from EngineHPT_map_fixed import EngineHPTMap as EngineHPTFixedMap
 
-# ── Shared utilities from combustor_py_cycle ─────────────────────────────────
-from combustor_py_cycle import (
-    # constants
-    DPQP_FIXED, DPQP_TOL, MAX_OUTER,
-    RANKINE_TO_K,
+from combustor_turboshaft import (
+    _make_mp_turboshaft,
+    solve_od, extract_design, compute_CdA,
+    gauntner_cooling_fracs, turb_rel_temp_rankine, t_metal_rankine,
+    estimate_T3_rankine, map_design_point, _std_atm,
+    nan_result, draw_compressor_map_background,
+    DPQP_DESIGN, RANKINE_TO_K, LBM_S_TO_KG_S, HP_TO_KW, PSI_TO_PA,
     ETA_COOL, T_METAL_VANE_R, T_METAL_BLADE_R,
-    # unit helpers
-    rankine_to_kelvin, psi_to_pa, lbm_s_to_kg_s,
-    # combustor physics
-    physics_pib, calc_CdA_liner,
-    # cycle helpers — extract_od_point includes T4_exit
-    map_design_point, extract_eta_th,
-    extract_design, extract_od_point,
-    set_turb_area, _connect_od_scalars, _run_od_sweep_sequential,
-    # cooling & life
-    estimate_T3_rankine, gauntner_cooling_fracs, turb_rel_temp_rankine,
-    lmp_life_ratio,
 )
+from combustor_py_cycle import lmp_life_ratio
 
+if os.name == 'nt':
+    os.system('cls')
 
-def clear_terminal():
-    if os.name == 'nt':
-        os.system('cls')
+# ══════════════════════════════════════════════════════════════════════════════
+#  STUDY PARAMETERS
+# ══════════════════════════════════════════════════════════════════════════════
 
+_TIT_R_des  = 2370.0         # design turbine inlet temperature (°R)
+_HP_N_des   = 8070.0         # design HP shaft speed (rpm)
+_OPR_des    = 13.5           # overall pressure ratio
+_comp_eff   = 0.83
+_Np_des     = _HP_N_des / np.sqrt(_TIT_R_des)
 
-clear_terminal()
-ureg = pint.UnitRegistry()
-Q_   = ureg.Quantity
+PWR_FRACS  = list(np.linspace(0.60, 1.00, 15))    # fraction of design SHP
+A4_SCALARS = list(np.linspace(0.85, 1.00, 30))   # NGV throat area scalars (closing only)
 
-# Reference for LMP: Gauntner rotor blade allowable (= "design life" baseline)
-_T_METAL_REF_K = T_METAL_BLADE_R * RANKINE_TO_K   # ≈ 1172 K
+# Newton convergence controls — tighten for publication, loosen for quick runs
+OD_ATOL    = 1e-8   # absolute residual tolerance  (setup default: 1e-6)
+OD_RTOL    = 1e-8   # relative residual tolerance  (setup default: 1e-6)
+OD_MAXITER = 100     # max Newton iterations         (solve_od default: 30)
+
+_T_METAL_REF_K = T_METAL_BLADE_R * RANKINE_TO_K  # LMP reference (blade allowable)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  SIMPLIFIED CYCLE MODEL
-#  Uses fixed cooling fracs as cycle params — supports zero-cooling scenarios.
-#  combustor_py_cycle uses CoolingCalcs inside the Newton solve (dynamic fracs)
-#  which cannot represent zero-cooling baseline conditions.
+#  RESULT ANNOTATION
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _make_turbojet_core(comp_map, turb_map):
-    def _setup_core(self):
-        self.options['thermo_method'] = 'TABULAR'
-        self.options['thermo_data']   = pyc.AIR_JETA_TAB_SPEC
-
-        self.add_subsystem('fc',     pyc.FlightConditions())
-        self.add_subsystem('inlet',  pyc.Inlet())
-        self.add_subsystem('comp',   pyc.Compressor(map_data=comp_map,
-                                                     map_extrap=True),
-                                     promotes_inputs=['Nmech'])
-        self.add_subsystem('bld3',   pyc.BleedOut(bleed_names=['ngv_cool', 'bld_cool']))
-        self.add_subsystem('burner', pyc.Combustor(fuel_type='FAR'))
-        self.add_subsystem('turb',   pyc.Turbine(map_data=turb_map,
-                                                  bleed_names=['ngv_cool', 'bld_cool'],
-                                                  map_extrap=True),
-                                     promotes_inputs=['Nmech'])
-        self.add_subsystem('nozz',   pyc.Nozzle(nozzType='CD', lossCoef='Cv'))
-        self.add_subsystem('shaft',  pyc.Shaft(num_ports=2),
-                                     promotes_inputs=['Nmech'])
-        self.add_subsystem('perf',   pyc.Performance(num_nozzles=1, num_burners=1))
-
-        self.pyc_connect_flow('fc.Fl_O',       'inlet.Fl_I',  connect_w=False)
-        self.pyc_connect_flow('inlet.Fl_O',    'comp.Fl_I')
-        self.pyc_connect_flow('comp.Fl_O',     'bld3.Fl_I')
-        self.pyc_connect_flow('bld3.Fl_O',     'burner.Fl_I')
-        self.pyc_connect_flow('burner.Fl_O',   'turb.Fl_I')
-        self.pyc_connect_flow('bld3.ngv_cool', 'turb.ngv_cool', connect_stat=False)
-        self.pyc_connect_flow('bld3.bld_cool', 'turb.bld_cool', connect_stat=False)
-        self.pyc_connect_flow('turb.Fl_O',     'nozz.Fl_I')
-
-        self.connect('comp.trq',         'shaft.trq_0')
-        self.connect('turb.trq',         'shaft.trq_1')
-        self.connect('fc.Fl_O:stat:P',   'nozz.Ps_exhaust')
-        self.connect('inlet.Fl_O:tot:P', 'perf.Pt2')
-        self.connect('comp.Fl_O:tot:P',  'perf.Pt3')
-        self.connect('burner.Wfuel',     'perf.Wfuel_0')
-        self.connect('inlet.F_ram',      'perf.ram_drag')
-        self.connect('nozz.Fg',          'perf.Fg_0')
-
-        newton = self.nonlinear_solver = om.NewtonSolver()
-        newton.options['atol']             = 1e-6
-        newton.options['rtol']             = 1e-6
-        newton.options['iprint']           = 2
-        newton.options['maxiter']          = 15
-        newton.options['solve_subsystems'] = True
-        newton.options['max_sub_solves']   = 100
-        newton.options['reraise_child_analysiserror'] = False
-        self.linear_solver = om.DirectSolver()
-
-    return _setup_core
-
-
-def _make_turbojet(cfg):
-    _core = _make_turbojet_core(cfg['comp_map'], cfg['turb_map'])
-
-    class Turbojet(pyc.Cycle):
-        def setup(self):
-            _core(self)
-            design = self.options['design']
-            bal = self.add_subsystem('balance', om.BalanceComp())
-            if design:
-                bal.add_balance('W', units='lbm/s', eq_units='lbf',
-                                rhs_name='Fn_target')
-                self.connect('balance.W',  'inlet.Fl_I:stat:W')
-                self.connect('perf.Fn',    'balance.lhs:W')
-
-                bal.add_balance('FAR', eq_units='degR', lower=1e-4,
-                                val=0.017, rhs_name='T4_target')
-                self.connect('balance.FAR',       'burner.Fl_I:FAR')
-                self.connect('burner.Fl_O:tot:T', 'balance.lhs:FAR')
-
-                bal.add_balance('turb_PR', val=1.5, lower=1.001, upper=8,
-                                eq_units='hp', rhs_val=0.)
-                self.connect('balance.turb_PR', 'turb.PR')
-                self.connect('shaft.pwr_net',   'balance.lhs:turb_PR')
-            super().setup()
-
-    return Turbojet
-
-
-def _make_turbojet_const_fn(cfg):
-    _core = _make_turbojet_core(cfg['comp_map'], cfg['turb_map'])
-
-    class TurbojetConstFn(pyc.Cycle):
-        def setup(self):
-            _core(self)
-            bal = self.add_subsystem('balance', om.BalanceComp())
-
-            bal.add_balance('FAR', eq_units='lbf', lower=1e-4,
-                            val=0.017, rhs_name='Fn_target')
-            self.connect('balance.FAR', 'burner.Fl_I:FAR')
-            self.connect('perf.Fn',     'balance.lhs:FAR')
-
-            bal.add_balance('Nmech', val=8070., units='rpm',
-                            lower=500., eq_units='hp', rhs_val=0.)
-            self.connect('balance.Nmech', 'Nmech')
-            self.connect('shaft.pwr_net', 'balance.lhs:Nmech')
-
-            bal.add_balance('W', val=168.0, units='lbm/s',
-                            eq_units='inch**2', rhs_name='nozz_area_target')
-            self.connect('balance.W',             'inlet.Fl_I:stat:W')
-            self.connect('nozz.Throat:stat:area', 'balance.lhs:W')
-            super().setup()
-
-    return TurbojetConstFn
-
-
-def _add_design_point_and_params(mp, Turbojet, cfg, include_dPqP=True):
-    mp.pyc_add_pnt('DESIGN', Turbojet())
-    mp.set_input_defaults('DESIGN.Nmech',     cfg['Nmech'],    units='rpm')
-    mp.set_input_defaults('DESIGN.inlet.MN',  cfg['inlet_MN'])
-    mp.set_input_defaults('DESIGN.comp.MN',   cfg['comp_MN'])
-    mp.set_input_defaults('DESIGN.burner.MN', cfg['burner_MN'])
-    mp.set_input_defaults('DESIGN.turb.MN',   cfg['turb_MN'])
-    if include_dPqP:
-        mp.pyc_add_cycle_param('burner.dPqP', cfg['burner_dPqP'])
-    mp.pyc_add_cycle_param('nozz.Cv',              cfg['nozz_Cv'])
-    mp.pyc_add_cycle_param('bld3.ngv_cool:frac_W', cfg['ngv_cool_frac'])
-    mp.pyc_add_cycle_param('bld3.bld_cool:frac_W', cfg['bld_cool_frac'])
-    mp.pyc_add_cycle_param('turb.ngv_cool:frac_P', 1.0)
-    mp.pyc_add_cycle_param('turb.bld_cool:frac_P', 0.0)
-
-
-def _make_mp_single_fn(cfg):
-    Turbojet        = _make_turbojet(cfg)
-    TurbojetConstFn = _make_turbojet_const_fn(cfg)
-
-    class MPSingleFn(pyc.MPCycle):
-        def setup(self):
-            _add_design_point_and_params(self, Turbojet, cfg, include_dPqP=False)
-            self.a4_scalars = cfg['a4_scalars']
-            self.od_pts     = [f'A4_{i:03d}' for i in range(len(self.a4_scalars))]
-
-            for pt in self.od_pts:
-                self.pyc_add_pnt(pt, TurbojetConstFn(design=False))
-                self.set_input_defaults(pt + '.fc.MN',  0.000001)
-                self.set_input_defaults(pt + '.fc.alt', 0.0, units='ft')
-
-            _connect_od_scalars(self, self.od_pts)
-            super().setup()
-
-    return MPSingleFn
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  SWEEPS
-# ══════════════════════════════════════════════════════════════════════════════
-
-def _annotate_result(r, prob, pt, a4, fn_frac, dPqP, bld_cool_frac):
-    """Add derived quantities (η_th, cooling req, T_metal, life ratio) in-place."""
-    r.update(a4_scalar=a4, dPqP=dPqP, fn_frac=fn_frac,
-             eta_th=extract_eta_th(prob, pt))
-    req_ngv, req_blade = gauntner_cooling_fracs(r['T4'], r['T3'],
-                                                 T4_exit_R=r['T4_exit'])
-    r['req_frac_ngv']   = req_ngv
-    r['req_frac_blade'] = req_blade
-
-    Tt4_rel_K       = turb_rel_temp_rankine(r['T4'], r['T4_exit']) * RANKINE_TO_K
-    T3_K            = r['T3'] * RANKINE_TO_K
-    r['T_metal']    = Tt4_rel_K - ETA_COOL * bld_cool_frac * (Tt4_rel_K - T3_K)
-    r['life_ratio'] = lmp_life_ratio(_T_METAL_REF_K, r['T_metal'])
-
-
-def run_fixed_dPqP_sweep(prob, mp, design_results, fn_frac, cfg, mode,
-                          bld_cool_frac=0.0):
-    print(f"\n  Fixed dP/P={DPQP_FIXED*100:.0f}%  {fn_frac*100:.0f}% Fn")
-    Fn_target = fn_frac * cfg['Fn_design']
-    for pt, a4 in zip(mp.od_pts, mp.a4_scalars):
-        set_turb_area(prob, pt, a4, design_results['s_Wp_design'], mode)
-        prob.set_val(f'{pt}.balance.Fn_target', Fn_target, units='lbf')
-        prob.set_val(f'{pt}.burner.dPqP', DPQP_FIXED)
-        prob[pt + '.balance.Nmech'] = (design_results['Nmech']
-                                       * fn_frac**0.5 * (1.0/a4)**0.3)
-        prob[pt + '.balance.FAR']   = cfg.get('FAR_guess', 0.017) * fn_frac
-
-    _run_od_sweep_sequential(prob, mp, maxiter=15)
-
-    results = []
-    for pt, a4 in zip(mp.od_pts, mp.a4_scalars):
-        r = extract_od_point(prob, pt)
-        _annotate_result(r, prob, pt, a4, fn_frac, DPQP_FIXED, bld_cool_frac)
-        results.append(r)
-    return results
-
-
-def run_physics_dPqP_sweep(prob, mp, design_results, fn_frac, cfg, mode,
-                            bld_cool_frac=0.0):
-    print(f"\n  Physics dP/P  {fn_frac*100:.0f}% Fn")
-    Fn_target = fn_frac * cfg['Fn_design']
-    dPqP_cur  = {pt: DPQP_FIXED for pt in mp.od_pts}
-
-    for outer in range(MAX_OUTER):
-        print(f"\n  Outer iter {outer+1}/{MAX_OUTER}")
-        for pt, a4 in zip(mp.od_pts, mp.a4_scalars):
-            set_turb_area(prob, pt, a4, design_results['s_Wp_design'], mode)
-            prob.set_val(f'{pt}.balance.Fn_target', Fn_target, units='lbf')
-            prob.set_val(f'{pt}.burner.dPqP', dPqP_cur[pt])
-            prob[pt + '.balance.Nmech'] = (design_results['Nmech']
-                                           * fn_frac**0.5 * (1.0/a4)**0.3)
-            prob[pt + '.balance.FAR']   = cfg.get('FAR_guess', 0.017) * fn_frac
-
-        _run_od_sweep_sequential(prob, mp, maxiter=15)
-
-        dPqP_new, max_change = {}, 0.0
-        for pt in mp.od_pts:
-            r = extract_od_point(prob, pt)
-            _, dPqP_phys = physics_pib(
-                psi_to_pa(r['P3']), rankine_to_kelvin(r['T3']),
-                lbm_s_to_kg_s(r['W']), design_results['CdA_liner'])
-            dPqP_phys    = float(np.clip(dPqP_phys, 0.001, 0.50))
-            dPqP_new[pt] = dPqP_phys
-            change       = abs(dPqP_phys - dPqP_cur[pt]) / max(dPqP_cur[pt], 1e-6)
-            max_change   = max(max_change, change)
-            print(f'    {pt}  dP/P: {dPqP_cur[pt]*100:.2f}%→{dPqP_phys*100:.2f}%')
-
-        print(f'  max change={max_change*100:.3f}%')
-        dPqP_cur = dPqP_new
-        if max_change < DPQP_TOL:
-            print(f'  Converged in {outer+1} iters')
-            break
-
-    # Cleanup pass at converged dPqP values
-    print('\n  Final cleanup pass...')
-    for pt in mp.od_pts:
-        prob.set_val(f'{pt}.burner.dPqP', dPqP_cur[pt])
-    _run_od_sweep_sequential(prob, mp, maxiter=20)
-
-    results = []
-    for pt, a4 in zip(mp.od_pts, mp.a4_scalars):
-        r = extract_od_point(prob, pt)
-        _annotate_result(r, prob, pt, a4, fn_frac, dPqP_cur[pt], bld_cool_frac)
-        results.append(r)
-    return results
+def _annotate(r):
+    """Add LMP life ratio and Gauntner prescription fracs in-place.
+    T_metal_blade is already in the result from extract_od()."""
+    if not r.get('converged'):
+        r.update(life_ratio=np.nan, req_frac_ngv=np.nan, req_frac_blade=np.nan)
+        return
+    r['life_ratio'] = lmp_life_ratio(_T_METAL_REF_K, r['T_metal_blade'])
+    f_ngv, f_bld = gauntner_cooling_fracs(r['T4'], r['T3'], T4_exit_R=r['T4_exit'])
+    r['req_frac_ngv']   = f_ngv
+    r['req_frac_blade'] = f_bld
 
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  SCENARIO RUNNER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def run_scenario(scenario_name, cfg, mode, turb_map, turb_eff, turb_PR_guess,
-                 ngv_cool_frac, bld_cool_frac):
+def run_scenario(label, cfg, pwr_fracs, a4_scalars):
+    """
+    Build turboshaft MPCycle, solve design point, then run the 2-D
+    (pwr_frac × a4_scalar) sweep via solve_od().
+
+    Returns
+    -------
+    dict with keys:
+      'label'   : str
+      'des'     : design-point result dict (from extract_design)
+      'results' : nested dict  results[pwr_frac][a4_scalar]
+    """
     print(f"\n{'█'*70}")
-    print(f" SCENARIO: {scenario_name}")
+    print(f"  {label}")
     print(f"{'█'*70}")
-    print(f" Cooling: NGV={ngv_cool_frac*100:.1f}%  blade={bld_cool_frac*100:.1f}%")
 
-    cfg = {
-        **cfg,
-        'turb_map':      turb_map,
-        'turb_eff':      turb_eff,
-        'turb_PR_guess': turb_PR_guess,
-        'ngv_cool_frac': ngv_cool_frac,
-        'bld_cool_frac': bld_cool_frac,
-    }
-
-    MPSingleFn = _make_mp_single_fn(cfg)
     prob = om.Problem()
-    mp   = prob.model = MPSingleFn()
+    prob.model = _make_mp_turboshaft(cfg)()
     prob.setup(check=False)
-
-    prob.set_val('DESIGN.fc.alt',            0.0,              units='ft')
-    prob.set_val('DESIGN.fc.MN',             0.000001)
-    prob.set_val('DESIGN.balance.Fn_target', cfg['Fn_design'], units='lbf')
-    prob.set_val('DESIGN.balance.T4_target', cfg['T4_design'], units='degR')
-    prob.set_val('DESIGN.comp.PR',           cfg['OPR'])
-    prob.set_val('DESIGN.comp.eff',          cfg['comp_eff'])
-    prob.set_val('DESIGN.turb.eff',          cfg['turb_eff'])
-    prob.set_val('DESIGN.burner.dPqP',       DPQP_FIXED)
-    if mode == 'alpha':
-        prob.set_val('DESIGN.turb.map.alphaMap', 1.0)
-    prob['DESIGN.balance.FAR']     = cfg.get('FAR_guess', 0.0175)
-    prob['DESIGN.balance.W']       = cfg.get('W_guess', 168.0)
-    prob['DESIGN.balance.turb_PR'] = cfg.get('turb_PR_guess', 3.5)
-    prob['DESIGN.fc.balance.Pt']   = 14.696
-    prob['DESIGN.fc.balance.Tt']   = 518.67
-    for pt in mp.od_pts:
-        prob.model._get_subsystem(pt).nonlinear_solver.options['maxiter'] = 0
     prob.set_solver_print(level=-1)
     prob.set_solver_print(level=2, depth=1)
+
+    Pt_des, Tt_des = _std_atm(cfg['alt'])
+
+    # ── Design solve ──────────────────────────────────────────────────────────
+    prob.set_val('DESIGN.fc.alt',                cfg['alt'],           units='ft')
+    prob.set_val('DESIGN.fc.MN',                 cfg['MN'])
+    prob.set_val('DESIGN.balance.T4_target',      cfg['TIT_R'],         units='degR')
+    prob.set_val('DESIGN.balance.pwr_target',     cfg['SHP'],           units='hp')
+    prob.set_val('DESIGN.balance.nozz_PR_target', cfg['nozz_PR_target'])
+    prob.set_val('DESIGN.comp.PR',                cfg['OPR'])
+    prob.set_val('DESIGN.comp.eff',               cfg['comp_eff'])
+    prob.set_val('DESIGN.turb.eff',               cfg['turb_eff'])
+    prob.set_val('DESIGN.pt.eff',                 cfg['pt_eff'])
+    prob.set_val('DESIGN.burner.dPqP',            cfg['dPqP'])
+
+    prob['DESIGN.balance.FAR']     = 0.0175
+    prob['DESIGN.balance.W']       = 27.0
+    prob['DESIGN.balance.turb_PR'] = 3.87
+    prob['DESIGN.balance.pt_PR']   = 2.0
+    prob['DESIGN.fc.balance.Pt']   = Pt_des
+    prob['DESIGN.fc.balance.Tt']   = Tt_des
+
+    # Seed CoolingCalcs from Gauntner pre-estimate
+    prob.set_val('DESIGN.cool_fracs.frac_ngv', cfg['ngv_cool_frac'])
+    prob.set_val('DESIGN.cool_fracs.frac_bld', cfg['bld_cool_frac'])
+
+    prob.model._get_subsystem('SWEEP').nonlinear_solver.options['maxiter'] = 0
+    prob.model._get_subsystem('DESIGN').nonlinear_solver.options['maxiter'] = 30
 
     print('\n── Design point ──')
     t0 = time.time()
     prob.run_model()
-    print(f'Design solved in {time.time()-t0:.1f}s')
+    print(f'  Solved in {time.time()-t0:.1f}s')
 
     des = extract_design(prob)
-    print(f"  T4={des['T4_design']*RANKINE_TO_K:.1f}K  "
-          f"T3={des['T3_design']*RANKINE_TO_K:.1f}K  "
-          f"eff={des['eff_design']*100:.3f}%  s_Wp={des['s_Wp_design']:.6f}")
+    des['CdA_liner']     = compute_CdA(des)
+    des['ngv_cool_frac'] = float(prob.get_val('DESIGN.cool_fracs.frac_ngv')[0])
+    des['bld_cool_frac'] = float(prob.get_val('DESIGN.cool_fracs.frac_bld')[0])
 
-    # CdA from design point
-    des['CdA_liner'] = calc_CdA_liner(
-        des['T3_design'] * RANKINE_TO_K,
-        psi_to_pa(des['P3_design']),
-        lbm_s_to_kg_s(des['W']))
+    print(f"  OPR={des['OPR']:.3f}  Tt4={des['T4']*RANKINE_TO_K:.1f}K  "
+          f"SHP={des['SHP']:.0f}hp  PSFC={des['PSFC']:.5f}")
+    print(f"  GGT_PR={des['turb_PR']:.3f}  PT_PR={des['pt_PR']:.3f}  "
+          f"turb_s_Wp={des['turb_s_Wp']:.6f}")
+    print(f"  Cool NGV={des['ngv_cool_frac']*100:.2f}%  "
+          f"blade={des['bld_cool_frac']*100:.2f}%  "
+          f"CdA={des['CdA_liner']:.4e} m²")
 
-    # Re-anchor CdA at A4=1.0, 100% Fn for better accuracy
-    if 1.00 in cfg['fn_fractions']:
-        run_fixed_dPqP_sweep(prob, mp, des, 1.00, cfg, mode, bld_cool_frac)
-        a4_1 = min(mp.a4_scalars, key=lambda a: abs(a - 1.0))
-        idx1 = mp.a4_scalars.index(a4_1)
-        pt1  = mp.od_pts[idx1]
-        r1   = extract_od_point(prob, pt1)
-        des['CdA_liner'] = calc_CdA_liner(
-            r1['T3'] * RANKINE_TO_K,
-            psi_to_pa(r1['P3']),
-            lbm_s_to_kg_s(r1['W']))
-        print(f"  CdA (re-anchored) = {des['CdA_liner']*1e4:.4f} cm²")
+    # Freeze DESIGN; restore SWEEP solver for OD runs
+    prob.model._get_subsystem('DESIGN').nonlinear_solver.options['maxiter'] = 0
+    prob.model._get_subsystem('SWEEP').nonlinear_solver.options['maxiter'] = OD_MAXITER
 
-    print('\n── Fixed dP/P sweep ──')
-    fixed_by_fn = {}
-    for fn_frac in cfg['fn_fractions']:
-        fixed_by_fn[fn_frac] = run_fixed_dPqP_sweep(
-            prob, mp, des, fn_frac, cfg, mode, bld_cool_frac)
+    # ── Prime SWEEP at 100% A4=1.0 to put prob in a physical OD state ────────
+    print('\n── Priming SWEEP at 100% power, A4=1.0 ──')
+    _prime = solve_od(prob, des,
+                      turb_s_Wp=des['turb_s_Wp'],
+                      pt_s_Wp=des['pt_s_Wp'],
+                      pwr_hp=des['SHP'],
+                      warm=des,
+                      label='prime',
+                      atol=OD_ATOL, rtol=OD_RTOL, maxiter=OD_MAXITER)
+    print(f"  {'OK' if _prime['converged'] else 'FAILED'}: "
+          f"η_th={_prime.get('eta_th', np.nan)*100:.3f}%  "
+          f"Tt4={_prime.get('T4', np.nan)*RANKINE_TO_K:.1f}K")
 
-    print('\n── Physics dP/P sweep ──')
-    physics_by_fn = {}
-    for fn_frac in cfg['fn_fractions']:
-        physics_by_fn[fn_frac] = run_physics_dPqP_sweep(
-            prob, mp, des, fn_frac, cfg, mode, bld_cool_frac)
+    # ── 2-D sweep: outer=A4 (1.0→0.85), inner=power (100%→60%) ─────────────────
+    _a4_sorted  = sorted(a4_scalars, reverse=True)   # 1.0 → 0.85
+    _pf_sorted  = sorted(pwr_fracs,  reverse=True)   # 100% → 60%
+    results     = {pf: {} for pf in pwr_fracs}
 
-    return {
-        'name':          scenario_name,
-        'cooling':       f"{ngv_cool_frac*100:.2f}% NGV + {bld_cool_frac*100:.2f}% blade",
-        'ngv_cool_frac': ngv_cool_frac,
-        'bld_cool_frac': bld_cool_frac,
-        'fixed_dpqp':    fixed_by_fn,
-        'phys_dpqp':     physics_by_fn,
-        'design':        des,
-    }
+    for a4 in _a4_sorted:
+        print(f"\n  ── A4 = {a4:.3f} ──")
+        prev = None   # None → solve_od cold-starts from des (correct at 100%)
+
+        for pf in _pf_sorted:
+            pwr_hp = pf * des['SHP']
+
+            r = solve_od(prob, des,
+                         turb_s_Wp=des['turb_s_Wp'] * a4,
+                         pt_s_Wp=des['pt_s_Wp'],
+                         pwr_hp=pwr_hp,
+                         warm=prev,
+                         label=f'a4={a4:.3f} {pf*100:.0f}%',
+                         atol=OD_ATOL, rtol=OD_RTOL, maxiter=OD_MAXITER)
+
+            _annotate(r)
+            r['a4_scalar'] = a4
+            r['pwr_frac']  = pf
+            results[pf][a4] = r
+
+            if r['converged']:
+                prev = r
+            else:
+                prev = None   # force cold-start on next power step
+
+            ok = 'OK' if r.get('converged') else 'FAIL'
+            print(f"    {pf*100:.0f}%  {ok}"
+                  f"  η_th={r.get('eta_th', np.nan)*100:.3f}%"
+                  f"  T4={r.get('T4', np.nan)*RANKINE_TO_K:.1f}K"
+                  f"  Tmbl={r.get('T_metal_blade', np.nan):.0f}K"
+                  f"  PSFC={r.get('PSFC', np.nan):.5f}")
+
+    return {'label': label, 'des': des, 'results': results, 'prob': prob}
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _arr(results, pf, a4s, key):
+    return np.array([results[pf][a].get(key, np.nan) for a in a4s])
+
+
+def _opt_a4_idx(results, pf, a4_scalars, key='eta_th', minimize=False):
+    """Index of A4 that maximises (or minimises) the given key."""
+    vals = _arr(results, pf, a4_scalars, key)
+    if not np.any(np.isfinite(vals)):
+        return None
+    return int(np.nanargmin(vals) if minimize else np.nanargmax(vals))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PLOTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def plot_comp_map(scenarios, pwr_fracs, a4_scalars, out_dir=''):
+    """
+    Compressor map with operating clouds for each scenario.
+    Each line = one power level; dots walk along A4 from 1.0 (left) to 0.85 (right).
+    """
+    pct  = np.array(pwr_fracs) * 100
+    cmap = cm.viridis
+    cv   = np.linspace(0.15, 0.90, len(pwr_fracs))
+    sm   = plt.cm.ScalarMappable(cmap=cmap,
+                                  norm=plt.Normalize(pct.min(), pct.max()))
+    sm.set_array([])
+
+    ncols = len(scenarios)
+    fig, axes = plt.subplots(1, ncols, figsize=(9 * ncols, 7), sharey=True)
+    if ncols == 1:
+        axes = [axes]
+    fig.suptitle('AXI5 Compressor Map  —  Operating clouds (A₄ = 1.0 → 0.85)\n'
+                 'Each line = power level; colour = power fraction',
+                 fontsize=12, fontweight='bold')
+
+    for col, sc in enumerate(scenarios):
+        ax   = axes[col]
+        prob = sc['prob']
+        des  = sc['des']
+        res  = sc['results']
+
+        # Background: efficiency contours, Nc lines, R-lines, stall line
+        eff_cf = draw_compressor_map_background(
+            ax, prob, 'DESIGN.comp', alpha_idx=0,
+            eff_vals=np.array([0.55, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]),
+            show_rlines=False, show_nclines=True, eff_alpha=0.75)
+
+        # Operating lines: one per power fraction, sweep over A4
+        for i, pf in enumerate(pwr_fracs):
+            wc = np.array([res[pf][a].get('comp_Wc', np.nan) for a in a4_scalars])
+            pr = np.array([res[pf][a].get('comp_PR', np.nan) for a in a4_scalars])
+            mask = np.isfinite(wc) & np.isfinite(pr)
+            if mask.any():
+                ax.plot(wc[mask], pr[mask], '-o', color=cmap(cv[i]),
+                        lw=1.8, ms=4, label=f'{pf*100:.0f}%', zorder=8)
+                # Mark the design-A4 (a4=1.0) point with a larger marker
+                a1_idx = a4_scalars.index(max(a4_scalars))
+                if mask[a1_idx]:
+                    ax.plot(wc[a1_idx], pr[a1_idx], 'o',
+                            color=cmap(cv[i]), ms=9,
+                            markeredgecolor='k', markeredgewidth=0.7, zorder=9)
+
+        # Design point star
+        ax.plot(des['comp_Wc'], des['comp_PR'],
+                '*', ms=18, color='gold', markeredgecolor='k',
+                markeredgewidth=1.2, zorder=10, label='Design pt')
+
+        ax.set_xlabel('Corrected mass flow  Wc  (lbm/s)', fontsize=11)
+        if col == 0:
+            ax.set_ylabel('Compressor PR  πc', fontsize=11)
+        ax.set_title(sc['label'], fontsize=10, fontweight='bold')
+        ax.legend(fontsize=7, title='Power %', loc='upper left')
+        ax.grid(True, alpha=0.2)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        fig.colorbar(eff_cf, ax=ax, shrink=0.65, label='Comp. efficiency')
+
+    fig.colorbar(sm, ax=axes[-1], shrink=0.40, pad=0.12,
+                 label='Power fraction (%)')
+    fig.tight_layout()
+    fp = os.path.join(out_dir, 'ts_compressor_map.png')
+    fig.savefig(fp, dpi=150, bbox_inches='tight')
+    print(f'  Saved: {fp}')
+
+
+def _ax_style(ax, col, ylabel, scenario_label):
+    ax.axvline(1.0, color='gray', ls='--', lw=1.0, alpha=0.55)
+    ax.set_xlabel('A₄ scalar', fontsize=10)
+    if col == 0:
+        ax.set_ylabel(ylabel, fontsize=10)
+    ax.set_title(scenario_label, fontsize=9, fontweight='bold')
+    ax.grid(True, alpha=0.22)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+
+def plot_scenarios(scenarios, pwr_fracs, a4_scalars, out_dir=''):
+    a4s  = np.array(a4_scalars)
+    pct  = np.array(pwr_fracs) * 100
+    cmap = cm.viridis
+    cv   = np.linspace(0.15, 0.90, len(pwr_fracs))
+
+    ncols = len(scenarios)
+    sm    = plt.cm.ScalarMappable(cmap=cmap,
+                                   norm=plt.Normalize(pct.min(), pct.max()))
+    sm.set_array([])
+
+    SC = ['steelblue', 'firebrick', 'seagreen', 'darkorange']
+
+    # ── Figure 1: η_th vs A4 ─────────────────────────────────────────────────
+    fig1, axes1 = plt.subplots(1, ncols, figsize=(8*ncols, 6), sharey=False)
+    if ncols == 1:
+        axes1 = [axes1]
+    fig1.suptitle('Turboshaft Thermal Efficiency vs A₄ Scalar\n'
+                  'Dynamic Gauntner cooling · physics combustor dP/P',
+                  fontsize=12, fontweight='bold')
+
+    for col, sc in enumerate(scenarios):
+        ax  = axes1[col]
+        res = sc['results']
+        for i, pf in enumerate(pwr_fracs):
+            eta = _arr(res, pf, a4_scalars, 'eta_th') * 100
+            ax.plot(a4s, eta, '-o', color=cmap(cv[i]), lw=2.0, ms=4,
+                    label=f'{pf*100:.0f}%')
+            idx = _opt_a4_idx(res, pf, a4_scalars, 'eta_th')
+            if idx is not None:
+                ax.plot(a4s[idx], eta[idx], '*',
+                        color=cmap(cv[i]), ms=12,
+                        markeredgecolor='k', markeredgewidth=0.5, zorder=5)
+        _ax_style(ax, col, 'η_th  (%)', sc['label'])
+        ax.legend(fontsize=7, title='Power %', loc='best')
+
+    fig1.colorbar(sm, ax=axes1[-1], shrink=0.60, label='Power fraction (%)')
+    fig1.tight_layout()
+    fp = os.path.join(out_dir, 'ts_eta_th_vs_a4.png')
+    fig1.savefig(fp, dpi=150, bbox_inches='tight')
+    print(f'  Saved: {fp}')
+
+    # ── Figure 2: PSFC vs A4 ─────────────────────────────────────────────────
+    fig2, axes2 = plt.subplots(1, ncols, figsize=(8*ncols, 6), sharey=False)
+    if ncols == 1:
+        axes2 = [axes2]
+    fig2.suptitle('Turboshaft PSFC vs A₄ Scalar', fontsize=12, fontweight='bold')
+
+    for col, sc in enumerate(scenarios):
+        ax  = axes2[col]
+        res = sc['results']
+        for i, pf in enumerate(pwr_fracs):
+            psfc = _arr(res, pf, a4_scalars, 'PSFC')
+            ax.plot(a4s, psfc, '-o', color=cmap(cv[i]), lw=2.0, ms=4,
+                    label=f'{pf*100:.0f}%')
+            idx = _opt_a4_idx(res, pf, a4_scalars, 'PSFC', minimize=True)
+            if idx is not None:
+                ax.plot(a4s[idx], psfc[idx], '*',
+                        color=cmap(cv[i]), ms=12,
+                        markeredgecolor='k', markeredgewidth=0.5, zorder=5)
+        _ax_style(ax, col, 'PSFC  (lbm/hp/hr)', sc['label'])
+        ax.legend(fontsize=7, title='Power %', loc='best')
+
+    fig2.colorbar(sm, ax=axes2[-1], shrink=0.60, label='Power fraction (%)')
+    fig2.tight_layout()
+    fp = os.path.join(out_dir, 'ts_psfc_vs_a4.png')
+    fig2.savefig(fp, dpi=150, bbox_inches='tight')
+    print(f'  Saved: {fp}')
+
+    # ── Figure 3: T₄ and T_metal_blade vs A4 ─────────────────────────────────
+    fig3, axes3 = plt.subplots(2, ncols, figsize=(8*ncols, 10))
+    if ncols == 1:
+        axes3 = axes3.reshape(2, 1)
+    fig3.suptitle('Turboshaft Tt₄ and Blade Metal Temperature vs A₄ Scalar',
+                  fontsize=12, fontweight='bold')
+
+    for col, sc in enumerate(scenarios):
+        ax_t4 = axes3[0, col]
+        ax_tm = axes3[1, col]
+        res   = sc['results']
+
+        for i, pf in enumerate(pwr_fracs):
+            T4 = _arr(res, pf, a4_scalars, 'T4') * RANKINE_TO_K
+            Tm = _arr(res, pf, a4_scalars, 'T_metal_blade')
+            c  = cmap(cv[i])
+            ax_t4.plot(a4s, T4, '-o', color=c, lw=2.0, ms=4, label=f'{pf*100:.0f}%')
+            ax_tm.plot(a4s, Tm, '-o', color=c, lw=2.0, ms=4, label=f'{pf*100:.0f}%')
+
+        T4_des = sc['des']['T4'] * RANKINE_TO_K
+        ax_t4.axhline(T4_des, color='crimson', ls='-', lw=1.5,
+                      label=f'T₄ design = {T4_des:.0f} K')
+        ax_tm.axhline(_T_METAL_REF_K, color='k', ls=':', lw=1.5,
+                      label=f'Allowable {_T_METAL_REF_K:.0f} K')
+
+        _ax_style(ax_t4, col, 'Tt₄  (K)', sc['label'])
+        _ax_style(ax_tm, col, 'T_metal_blade  (K)', sc['label'])
+        ax_t4.legend(fontsize=7, title='Power %')
+        ax_tm.legend(fontsize=7, title='Power %')
+
+    fig3.tight_layout()
+    fp = os.path.join(out_dir, 'ts_temperatures_vs_a4.png')
+    fig3.savefig(fp, dpi=150, bbox_inches='tight')
+    print(f'  Saved: {fp}')
+
+    # ── Figure 4: Optimal A4 schedule + Δη_th between scenarios ──────────────
+    fig4, axes4 = plt.subplots(1, 2, figsize=(14, 6))
+    fig4.suptitle('Optimal A₄ Schedule and η_th Benefit  (turboshaft)',
+                  fontsize=12, fontweight='bold')
+
+    ax = axes4[0]
+    for j, sc in enumerate(scenarios):
+        opt = []
+        for pf in pwr_fracs:
+            idx = _opt_a4_idx(sc['results'], pf, a4_scalars, 'eta_th')
+            opt.append(a4_scalars[idx] if idx is not None else np.nan)
+        ax.plot(pct, opt, 'o-', color=SC[j % len(SC)], lw=2.2, ms=8,
+                label=sc['label'])
+    ax.axhline(1.0, color='gray', ls='--', lw=1.2, label='Design A₄ = 1.0')
+    ax.set_xlabel('Power fraction  (%)', fontsize=11)
+    ax.set_ylabel('Optimal A₄ scalar', fontsize=11)
+    ax.set_title('Optimal A₄ per Power Level  (max η_th)', fontsize=10)
+    ax.legend(fontsize=8)
+    ax.grid(True, alpha=0.25)
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+
+    ax = axes4[1]
+    if len(scenarios) >= 2:
+        sc1, sc2 = scenarios[0], scenarios[1]
+        for i, pf in enumerate(pwr_fracs):
+            eta1 = _arr(sc1['results'], pf, a4_scalars, 'eta_th') * 100
+            eta2 = _arr(sc2['results'], pf, a4_scalars, 'eta_th') * 100
+            ax.plot(a4s, eta2 - eta1, '-', color=cmap(cv[i]), lw=2.0,
+                    label=f'{pf*100:.0f}%')
+        ax.axhline(0.0, color='k', ls='--', lw=1.2)
+        ax.axvline(1.0, color='gray', ls='--', lw=1.0, alpha=0.55)
+        ax.set_xlabel('A₄ scalar', fontsize=11)
+        ax.set_ylabel(f'Δη_th  (%-pts)  [{sc2["label"]} − {sc1["label"]}]',
+                      fontsize=9)
+        ax.set_title('η_th Difference  (Scenario 2 − Scenario 1)', fontsize=10)
+        ax.legend(fontsize=7, title='Power %')
+        ax.grid(True, alpha=0.25)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        fig4.colorbar(sm, ax=ax, shrink=0.60, label='Power fraction (%)')
+
+    fig4.tight_layout()
+    fp = os.path.join(out_dir, 'ts_a4_schedule.png')
+    fig4.savefig(fp, dpi=150, bbox_inches='tight')
+    print(f'  Saved: {fp}')
+
+    plt.show()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -416,204 +477,92 @@ def run_scenario(scenario_name, cfg, mode, turb_map, turb_eff, turb_PR_guess,
 
 if __name__ == '__main__':
 
-    _Nmech   = 8070.0
-    _T4_degR = 2370.0
-    _Np_des  = _Nmech / np.sqrt(_T4_degR)
-
-    eff_fixed, PR_fixed = map_design_point(EngineHPTFixedMap, _Np_des)
     eff_vgt,   PR_vgt   = map_design_point(EngineHPTVGTMap,   _Np_des)
+    eff_fixed, PR_fixed = map_design_point(EngineHPTFixedMap, _Np_des)
 
-    print("=" * 70)
-    print(f"  Fixed: eta={eff_fixed*100:.3f}%  PR={PR_fixed:.4f}")
-    print(f"  VGT:   eta={eff_vgt*100:.3f}%    PR={PR_vgt:.4f}")
-    print(f"  Leakage penalty: Δeta={(eff_fixed-eff_vgt)*100:+.3f}%")
-    print("=" * 70)
+    print('=' * 70)
+    print(f'  VGT   map: η={eff_vgt*100:.3f}%   PR={PR_vgt:.4f}')
+    print(f'  Fixed map: η={eff_fixed*100:.3f}%   PR={PR_fixed:.4f}')
+    print(f'  Leakage penalty: Δη={(eff_fixed-eff_vgt)*100:+.3f}%')
+    print('=' * 70)
+
+    _T3_est_R        = estimate_T3_rankine(_OPR_des, comp_eff=_comp_eff)
+    _frac_ngv_des, _frac_blade_des = gauntner_cooling_fracs(_TIT_R_des, _T3_est_R)
+
+    print(f'  Gauntner pre-estimate: T4={_TIT_R_des:.0f}°R  T3≈{_T3_est_R:.1f}°R')
+    print(f'  NGV={_frac_ngv_des*100:.2f}%  blade={_frac_blade_des*100:.2f}%')
+    print(f'  A₄ scalars: {A4_SCALARS[0]:.2f} → {A4_SCALARS[-1]:.2f}'
+          f'  ({len(A4_SCALARS)} pts)')
+    print(f'  Power levels: {[f"{p*100:.0f}%" for p in PWR_FRACS]}')
+    print('=' * 70)
 
     BASE_CFG = dict(
-        comp_map     = pyc.HPCMap,
-        Fn_design    = 11800.0 * 0.5,
-        T4_design    = _T4_degR,
-        OPR          = 13.5 * 0.5,
-        Nmech        = _Nmech,
-        comp_eff     = 0.83,
-        inlet_MN     = 0.60,
-        comp_MN      = 0.020,
-        burner_MN    = 0.020,
-        turb_MN      = 0.40,
-        nozz_Cv      = 0.99,
-        FAR_guess    = 0.0175,
-        W_guess      = 168.0,
-        fn_fractions = [0.50, 1.00],
-        a4_scalars   = list(np.linspace(0.75, 1.00, 15)),
+        alt           = 0.0,
+        MN            = 0.001,
+        SHP           = 4000.0,
+        LP_Nmech      = 5000.0,
+        HP_Nmech_init = _HP_N_des,
+        TIT_R         = _TIT_R_des,
+        OPR           = _OPR_des,
+        comp_eff      = _comp_eff,
+        pt_eff        = 0.90,
+        inlet_MN      = 0.60,
+        comp_MN       = 0.20,
+        burner_MN     = 0.20,
+        turb_MN       = 0.40,
+        nozz_Cv       = 0.99,
+        nozz_PR_target= 1.2,
+        dPqP          = DPQP_DESIGN,
+        ngv_cool_frac = _frac_ngv_des,
+        bld_cool_frac = _frac_blade_des,
+        comp_map      = pyc.AXI5,
+        pt_map        = pyc.LPT2269,
     )
 
-    _T3_est   = estimate_T3_rankine(BASE_CFG['OPR'], comp_eff=BASE_CFG['comp_eff'])
-    _frac_ngv, _frac_blade = gauntner_cooling_fracs(BASE_CFG['T4_design'], _T3_est)
-    print("=" * 70)
-    print(f"  Gauntner sizing: T4={BASE_CFG['T4_design']:.0f}°R  T3_est={_T3_est:.1f}°R")
-    print(f"  T_metal_vane={T_METAL_VANE_R:.0f}°R  T_metal_blade={T_METAL_BLADE_R:.0f}°R")
-    print(f"  NGV={_frac_ngv*100:.2f}%  Blade={_frac_blade*100:.2f}%")
-    print("=" * 70)
-
-    # ── Run three scenarios ───────────────────────────────────────────────────
-
-    scen1 = run_scenario(
-        "Scenario 1: Zero Cooling, Fixed Turbine",
-        BASE_CFG, mode='sWp',
-        turb_map=EngineHPTFixedMap, turb_eff=eff_fixed, turb_PR_guess=PR_fixed,
-        ngv_cool_frac=0.0, bld_cool_frac=0.0,
+    # ── Scenario 1: Fixed turbine map ─────────────────────────────────────────
+    scen_fixed = run_scenario(
+        'Fixed Turbine (EngineHPT fixed)',
+        {**BASE_CFG, 'turb_map': EngineHPTFixedMap, 'turb_eff': eff_fixed},
+        PWR_FRACS, A4_SCALARS,
     )
 
-    scen2 = run_scenario(
-        "Scenario 2: Gauntner Cooling, VGT Turbine",
-        BASE_CFG, mode='alpha',
-        turb_map=EngineHPTVGTMap, turb_eff=eff_vgt, turb_PR_guess=PR_vgt,
-        ngv_cool_frac=_frac_ngv, bld_cool_frac=_frac_blade,
+    # ── Scenario 2: VGT turbine map ───────────────────────────────────────────
+    scen_vgt = run_scenario(
+        'VGT Turbine (EngineHPT VGT)',
+        {**BASE_CFG, 'turb_map': EngineHPTVGTMap, 'turb_eff': eff_vgt},
+        PWR_FRACS, A4_SCALARS,
     )
 
-    scen3 = run_scenario(
-        "Scenario 3: Zero Cooling, VGT Turbine",
-        BASE_CFG, mode='alpha',
-        turb_map=EngineHPTVGTMap, turb_eff=eff_vgt, turb_PR_guess=PR_vgt,
-        ngv_cool_frac=0.0, bld_cool_frac=0.0,
-    )
+    scenarios = [scen_fixed, scen_vgt]
 
-    all_scenarios = [scen1, scen2, scen3]
+    # ── Summary table ─────────────────────────────────────────────────────────
+    print('\n' + '=' * 88)
+    print('  OPTIMAL A4 SCHEDULE  (A4 that maximises η_th at each power level)')
+    print('=' * 88)
+    print(f"  {'Pwr%':>5}  "
+          f"{'A4_fix':>7}  {'η_fix%':>8}  {'PSFC_fix':>9}  "
+          f"{'A4_vgt':>7}  {'η_vgt%':>8}  {'PSFC_vgt':>9}  "
+          f"{'Δη%-pts':>8}")
+    print('  ' + '-' * 75)
+    for pf in PWR_FRACS:
+        a4s = A4_SCALARS
+        eta_f  = [scen_fixed['results'][pf][a].get('eta_th', np.nan) for a in a4s]
+        eta_v  = [scen_vgt['results'][pf][a].get('eta_th',  np.nan) for a in a4s]
+        psfc_f = [scen_fixed['results'][pf][a].get('PSFC',  np.nan) for a in a4s]
+        psfc_v = [scen_vgt['results'][pf][a].get('PSFC',   np.nan) for a in a4s]
+        idx_f  = int(np.nanargmax(eta_f))  if any(np.isfinite(e) for e in eta_f)  else 0
+        idx_v  = int(np.nanargmax(eta_v))  if any(np.isfinite(e) for e in eta_v)  else 0
+        d_eta  = (eta_v[idx_v] - eta_f[idx_f]) * 100
+        print(f"  {pf*100:5.0f}%  "
+              f"{a4s[idx_f]:7.3f}  {eta_f[idx_f]*100:8.4f}  {psfc_f[idx_f]:9.5f}  "
+              f"{a4s[idx_v]:7.3f}  {eta_v[idx_v]*100:8.4f}  {psfc_v[idx_v]:9.5f}  "
+              f"{d_eta:+8.4f}")
+    print('  ' + '-' * 75)
 
-    with open('thermal_efficiency_scenarios.pkl', 'wb') as f:
-        pickle.dump(all_scenarios, f)
-    print("\nSaved: thermal_efficiency_scenarios.pkl")
+    # ── Plots ──────────────────────────────────────────────────────────────────
+    plot_comp_map(scenarios, PWR_FRACS, A4_SCALARS)
+    plot_scenarios(scenarios, PWR_FRACS, A4_SCALARS)
 
-    # ── Plot helpers ──────────────────────────────────────────────────────────
-
-    fn_fracs = BASE_CFG['fn_fractions']
-    ncols    = len(fn_fracs)
-
-    COLORS  = {s['name']: c for s, c in zip(all_scenarios,
-                                             ['steelblue', 'darkorange', 'firebrick'])}
-    MARKERS = {s['name']: m for s, m in zip(all_scenarios, ['o', 's', '^'])}
-
-    def _arr(scen, fn_frac, key, src='phys_dpqp'):
-        return np.array([r[key] for r in scen[src][fn_frac]])
-
-    def _ax_defaults(ax, fn_frac):
-        ax.axvline(1.0, color='gray', ls='--', lw=1.2, alpha=0.6)
-        ax.set_xlabel('A₄ scalar')
-        ax.set_title(f'{fn_frac*100:.0f}% Fn', fontsize=11, fontweight='bold')
-        ax.legend(fontsize=7); ax.grid(True, alpha=0.3)
-        ax.spines['top'].set_visible(False)
-        ax.spines['right'].set_visible(False)
-
-    # ── Figure 1: η_th vs A₄ ─────────────────────────────────────────────────
-
-    fig1, axes1 = plt.subplots(1, ncols, figsize=(8*ncols, 6), sharey=False)
-    if ncols == 1:
-        axes1 = [axes1]
-    fig1.suptitle('Thermal Efficiency vs A₄ Scalar', fontsize=12, fontweight='bold')
-
-    for col, fn_frac in enumerate(fn_fracs):
-        ax = axes1[col]
-        for scen in all_scenarios:
-            ax.plot(_arr(scen, fn_frac, 'a4_scalar'),
-                    _arr(scen, fn_frac, 'eta_th') * 100,
-                    f"{MARKERS[scen['name']]}-",
-                    color=COLORS[scen['name']], lw=2.5, ms=6,
-                    label=scen['name'])
-        if col == 0:
-            ax.set_ylabel('η_th (%)')
-        _ax_defaults(ax, fn_frac)
-
-    fig1.tight_layout()
-    fig1.savefig('thermal_efficiency_scenarios.png', dpi=150, bbox_inches='tight')
-    print("Saved: thermal_efficiency_scenarios.png")
-
-    # ── Figure 2: Gauntner cooling prescription vs A₄ ────────────────────────
-
-    _frac_total_des = (_frac_ngv + _frac_blade) * 100
-
-    fig2, axes2 = plt.subplots(1, ncols, figsize=(8*ncols, 6), sharey=False)
-    if ncols == 1:
-        axes2 = [axes2]
-    fig2.suptitle(
-        'Gauntner Cooling Prescription vs A₄  (NASA-TM-81453)\n'
-        'Solid = prescription at OD conditions  |  Dashed = applied fraction',
-        fontsize=11, fontweight='bold')
-
-    for col, fn_frac in enumerate(fn_fracs):
-        ax = axes2[col]
-        for scen in all_scenarios:
-            s     = _arr(scen, fn_frac, 'a4_scalar')
-            f_tot = (_arr(scen, fn_frac, 'req_frac_ngv') +
-                     _arr(scen, fn_frac, 'req_frac_blade')) * 100
-            applied = (scen['ngv_cool_frac'] + scen['bld_cool_frac']) * 100
-            ax.plot(s, f_tot, f"{MARKERS[scen['name']]}-",
-                    color=COLORS[scen['name']], lw=2, ms=5, label=scen['name'])
-            ax.axhline(applied, color=COLORS[scen['name']], ls='--', lw=1.5, alpha=0.55)
-
-        # Shade cooling margin / deficit for Scenario 2
-        s2    = _arr(scen2, fn_frac, 'a4_scalar')
-        f2    = (_arr(scen2, fn_frac, 'req_frac_ngv') +
-                 _arr(scen2, fn_frac, 'req_frac_blade')) * 100
-        ax.fill_between(s2, _frac_total_des, f2, where=(f2 <= _frac_total_des),
-                        alpha=0.12, color=COLORS[scen2['name']], label='S2 margin')
-        ax.fill_between(s2, _frac_total_des, f2, where=(f2 > _frac_total_des),
-                        alpha=0.12, color='firebrick', label='S2 deficit')
-
-        if col == 0:
-            ax.set_ylabel('Cooling fraction (% W_gas)')
-        _ax_defaults(ax, fn_frac)
-
-    fig2.tight_layout()
-    fig2.savefig('gauntner_cooling_prescription.png', dpi=150, bbox_inches='tight')
-    print("Saved: gauntner_cooling_prescription.png")
-
-    # ── Figure 3: T_metal and LMP life ratio vs A₄ ───────────────────────────
-    # life_ratio referenced to T_METAL_BLADE_R (Gauntner allowable ≈ 1172 K)
-    # life_ratio > 1 → blade cooler than allowable → creep life extended
-    # life_ratio < 1 → blade over-temperature (zero-cooling scenarios)
-
-    fig3, axes3 = plt.subplots(2, ncols, figsize=(8*ncols, 10), sharey='row')
-    if ncols == 1:
-        axes3 = axes3.reshape(2, 1)
-    fig3.suptitle(
-        f'Blade Metal Temperature and LMP Life Ratio vs A₄\n'
-        f'Reference: T_blade = {_T_METAL_REF_K:.0f} K  '
-        f'(C=20, t_des=20 000 hr,  Larson & Miller 1952)',
-        fontsize=11, fontweight='bold')
-
-    for col, fn_frac in enumerate(fn_fracs):
-        ax_tm  = axes3[0, col]
-        ax_lmp = axes3[1, col]
-
-        for scen in all_scenarios:
-            s     = _arr(scen, fn_frac, 'a4_scalar')
-            tm_K  = _arr(scen, fn_frac, 'T_metal')
-            lr    = _arr(scen, fn_frac, 'life_ratio')
-            color = COLORS[scen['name']]
-            mkr   = MARKERS[scen['name']]
-
-            ax_tm.plot(s, tm_K, f'{mkr}-', color=color, lw=2.5, ms=6,
-                       label=scen['name'])
-            ax_lmp.plot(s, lr,  f'{mkr}-', color=color, lw=2.5, ms=6,
-                        label=scen['name'])
-
-        ax_tm.axhline(_T_METAL_REF_K, color='k', ls=':', lw=1.5,
-                      label=f'Allowable {_T_METAL_REF_K:.0f} K')
-        ax_lmp.axhline(1.0, color='k', ls=':', lw=1.5, label='Design life')
-
-        if col == 0:
-            ax_tm.set_ylabel('T_metal (K)')
-            ax_lmp.set_ylabel('Life ratio  t_r / t_r,des')
-
-        _ax_defaults(ax_tm,  fn_frac)
-        _ax_defaults(ax_lmp, fn_frac)
-
-    fig3.tight_layout()
-    fig3.savefig('blade_life_scenarios.png', dpi=150, bbox_inches='tight')
-    print("Saved: blade_life_scenarios.png")
-
-    plt.show()
-
-    print("\n" + "=" * 70)
-    print(" All scenarios completed.")
-    print("=" * 70)
+    print('\n' + '=' * 70)
+    print('  All scenarios complete.')
+    print('=' * 70)

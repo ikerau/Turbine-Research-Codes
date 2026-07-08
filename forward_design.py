@@ -12,6 +12,8 @@ Original file is located at
 import pint
 import numpy as np
 import os
+import io
+import contextlib
 import matplotlib.pyplot as plt
 from scipy.optimize import fsolve, brentq, least_squares
 from moc_blade import blade as moc_blade
@@ -52,6 +54,7 @@ from off_design import (
     stator_to_rotor_inlet,
     initialize_stator_inlet,
     blade_passage_new,
+    mdot_out,
     
     
     # Blade geometry
@@ -73,9 +76,16 @@ def rad(a: Q_) -> float:
 # ==========================================================
 # Blade profile builder (your exact method, just packaged)
 # ==========================================================
-def deviation_raw(o_m, pitch_m, Ma, gamma, lam_crit):
-    lam = mach_to_lambda(Ma, gamma)
-
+def deviation_raw(o_m, pitch_m, lam, gamma, lam_crit):
+    """
+    Matches off_design.deviation() / Zou et al. 2026 Appendix B (Eq. B1-B4):
+    the smoothstep blend is on actual Mach number (0.5 to 1.0), not
+    lam/lam_crit -- lam_crit is the polytropic choking threshold (can be
+    < 1 for a lossy row) and is a separate concept from the deviation
+    model's own Mach-based blend. lam_crit is accepted for signature
+    compatibility with callers that route choked vs. supersonic-deviation
+    decisions themselves; it is not used inside this function anymore.
+    """
     t     = float(pitch_m)
     o     = o_m
 
@@ -86,12 +96,12 @@ def deviation_raw(o_m, pitch_m, Ma, gamma, lam_crit):
     arg    = float(np.clip(arg, -1.0, 1.0))
     delta_0 = np.degrees(np.arcsin(arg)) - beta_g_circ
 
-    # Smoothstep from lam=0.5·lam_crit to lam_crit
-    lam_ratio = lam / lam_crit if lam_crit > 0 else 0.0
-    if lam_ratio <= 0.5:
+    # Smoothstep on Ma from 0.5 to 1.0 (Eq. B2), not lam/lam_crit.
+    Ma = lambda_to_mach(lam, gamma)
+    if Ma <= 0.5:
         delta = delta_0
-    elif lam_ratio <= 1.0:
-        X     = 2.0 * lam_ratio - 1.0   # 0 to 1 as lam goes 0.5·lam_crit to lam_crit
+    elif Ma <= 1.0:
+        X     = 2.0 * Ma - 1.0   # 0 to 1 as Ma goes 0.5 to 1.0
         delta = delta_0 * (1.0 - 10*X**3 + 15*X**4 - 6*X**5)
     else:
         delta = 0.0
@@ -474,50 +484,35 @@ def _walk_thermo(kin, gas, r_loss_s, r_loss_r):
         Ps = Pt * (1.0 - gm1_gp1 * lam**2) ** (gamma / (gamma - 1.0))
         return Ts, Ps
 
-    def _lam_polytropic(V, Tt, Pt_in, Pt_out, gamma, R):
+    def _lam_kinematic_static(V, Tt, Pt_out, gamma, R):
         """
-        Compute lam mirroring blade_passage_new:
-        1. Derive Ps from kinematic V and Tt (using Pt_out for static)
-        2. Compute n_poly from Pt_in/Ps and Pt_out/Ps
-        3. Recompute lam from polytropic relation using Pt_in
-        Iterate until gamma converges.
+        Exit lambda is purely kinematic (V, Tt) — it never depends on
+        pressure, since Tt is conserved (adiabatic, no work) and
+        lam = V/a_crit(Tt) by definition. Ps then follows by inverting the
+        total-static point relation against the row's ACTUAL (post-loss)
+        total pressure Pt_out.
+
+        This used to also run a "polytropic" correction using Pt_in
+        (mirroring blade_passage_new), re-deriving a second lambda from the
+        Pt_in/Ps and Pt_out/Ps ratios. That step is a provable no-op: for
+        Ps seeded from lam_kin via _static_from_lam(Pt_out), the resulting
+        n_poly/omn_n exponent exactly cancels the r_loss (Pt_in) dependence,
+        so the "polytropic" lambda always equals lam_kin again, for any
+        r_loss. Removed — Pt_in is not needed here at all.
         """
         gamma_i, R_i = gamma, R
 
         for _ in range(20):
-            # Step 1: get Ps from kinematic velocity and exit total pressure
-            lam_kin  = _lam_from_velocity(V, Tt, gamma_i, R_i)
-            Ts, Ps   = _static_from_lam(lam_kin, Tt, Pt_out, gamma_i)
+            lam    = _lam_from_velocity(V, Tt, gamma_i, R_i)
+            Ts, Ps = _static_from_lam(lam, Tt, Pt_out, gamma_i)
 
-            # Step 2: n_poly from Pt_in, Pt_out, Ps — same as blade_passage_new
-            gm1_g          = (gamma_i - 1.0) / gamma_i
-            Pt_in_over_Ps  = Pt_in  / Ps
-            Pt_out_over_Ps = Pt_out / Ps
-            if Pt_in_over_Ps <= 1.0 or Pt_out_over_Ps <= 1.0:
-                # No expansion — subsonic with negligible loss
-                lam_poly = lam_kin
-                break
-            n_poly = 1.0 / (1.0 - gm1_g * (
-                        np.log(Pt_out_over_Ps) / np.log(Pt_in_over_Ps)))
-
-            # Step 3: lam from polytropic relation using Pt_in
-            omn_n    = (1.0 - n_poly) / n_poly
-            gp1_gm1  = (gamma_i + 1.0) / (gamma_i - 1.0)
-            lam_poly = float(np.sqrt(np.clip(
-                            gp1_gm1 * (1.0 - Pt_in_over_Ps ** omn_n),
-                            0.0, None)))
-
-            # Update Ts and Ps with polytropic lam
-            Ts, Ps = _static_from_lam(lam_poly, Tt, Pt_out, gamma_i)
-
-            # Update gamma at new static conditions
             g_new, R_new, *_ = _iter_static(Ts, Ps, gamma_i, R_i)
             if abs(g_new - gamma_i) < 1e-7:
                 gamma_i, R_i = g_new, R_new
                 break
             gamma_i, R_i = g_new, R_new
 
-        return lam_poly, Ts, Ps, gamma_i, R_i
+        return lam, Ts, Ps, gamma_i, R_i
 
     # ── Station 1: stator inlet ───────────────────────────────────────────
     gamma_i, R_i = gamma0, R0
@@ -534,8 +529,8 @@ def _walk_thermo(kin, gas, r_loss_s, r_loss_r):
     Tt2  = Tt0
     Pt2  = r_loss_s * Pt0
 
-    lam_C2, Ts2, Ps2, gamma2, R2 = _lam_polytropic(
-        C2, Tt2, Pt0, Pt2, gamma1, R1)
+    lam_C2, Ts2, Ps2, gamma2, R2 = _lam_kinematic_static(
+        C2, Tt2, Pt2, gamma1, R1)
 
     g_new, R_new, Cp2, rho2, hs2, mu2 = _iter_static(Ts2, Ps2, gamma2, R2)
     gamma2, R2 = g_new, R_new
@@ -575,9 +570,8 @@ def _walk_thermo(kin, gas, r_loss_s, r_loss_r):
 
     Tt3_rel = Ts3 + W3**2 / (2.0 * Cp3_i)
 
-    # Now use _lam_polytropic for rotor exit — Pt_in = Pt2_rel
-    lam_W3, Ts3, Ps3, gamma3, R3 = _lam_polytropic(
-        W3, Tt3_rel, Pt2_rel, Pt3_rel, gamma2, R2)
+    lam_W3, Ts3, Ps3, gamma3, R3 = _lam_kinematic_static(
+        W3, Tt3_rel, Pt3_rel, gamma2, R2)
 
     g_new, R_new, Cp3, rho3, hs3, mu3 = _iter_static(Ts3, Ps3, gamma3, R3)
     gamma3, R3 = g_new, R_new
@@ -614,6 +608,7 @@ def _walk_thermo(kin, gas, r_loss_s, r_loss_r):
                     np.log(Pt3_rel/Ps3) / np.log(Pt2_rel/Ps3))),
     )
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  ANNULUS SIZING
 #  A = mdot / (rho * Cm)
@@ -628,7 +623,7 @@ def _size_annulus(kin, states, mdot_kg, stator_blade=None, rotor_blade=None):
 
     def _radii(rho, blockage=0.0):
         A_flow = mdot_kg / (rho * Cm)
-        A_phys = A_flow / (1.0 - blockage)
+        A_phys = A_flow# / (1.0 - blockage)
         half   = A_phys / (2 * np.pi)
         Ro_sq  = Rm**2 + half
         Ri_sq  = Rm**2 - half
@@ -699,10 +694,11 @@ def _q_func(lam, gamma):
     return lam * (gp1 / 2.0 * (1 - (gm1 / gp1) * lam**2)) ** (1.0 / gm1)
 
 
-def _delta_from_geometry(o_m, pitch_m, lam, lam_crit):
+def _delta_from_geometry(o_m, pitch_m, lam, gamma, lam_crit):
     """
-    Deviation magnitude delta using the same smoothstep as off_design.deviation().
-    Returns delta such that: alpha_out = arccos(o/t) - delta
+    Deviation magnitude delta using the same smoothstep as off_design.deviation()
+    / Zou et al. 2026 Eq. B2 -- blend is on actual Mach number (0.5 to 1.0),
+    not lam/lam_crit. Returns delta such that: alpha_out = arccos(o/t) - delta
     """
     sinb = float(np.clip(o_m / pitch_m, 0.0, 1.0))
     beta_g_circ = np.degrees(np.arcsin(sinb))
@@ -711,11 +707,11 @@ def _delta_from_geometry(o_m, pitch_m, lam, lam_crit):
     arg = float(np.clip(arg, -1.0, 1.0))
     delta_0 = np.degrees(np.arcsin(arg)) - beta_g_circ
 
-    lam_ratio = lam / lam_crit if lam_crit > 0 else 0.0
-    if lam_ratio <= 0.5:
+    Ma = lambda_to_mach(lam, gamma)
+    if Ma <= 0.5:
         return delta_0
-    elif lam_ratio < 1.0:
-        X = 2.0 * lam_ratio - 1.0
+    elif Ma < 1.0:
+        X = 2.0 * Ma - 1.0
         return delta_0 * (1.0 - 10*X**3 + 15*X**4 - 6*X**5)
     else:
         return 0.0
@@ -730,8 +726,10 @@ def _build_blade_geometry(
     tip_gap, tip_gap_stator,
     t_s_rotor,
     t_s_stator,
+    des_incidence_r=0.0,
     r_loss_s=1.0, r_loss_r=1.0,
     build_pritchard=True,
+    N_stator=None, N_rotor=None,
 ):
     """
     Build stator and rotor blade geometry dicts.
@@ -743,18 +741,28 @@ def _build_blade_geometry(
         beta2_flow_actual = beta2_flow_target.
 
     Supersonic (lam_exit >= lam_crit):
-        o is pinned by mass-flow continuity at the throat — never changes.
-        Required exit area A_exit is back-calculated from the target flow
-        angle via the sup_deviation mass-conservation equation:
+        Two independent constraints, not one:
+          (1) The exit flow angle past a choked throat is fixed by mass
+              conservation at the exit area, not by the blade metal angle
+              (sup_deviation()'s mdot_choke branch only sees the exit area).
+              mdot, q(lam_exit), and cos(beta2_flow) are all fixed, so the
+              required exit area follows directly (closed form):
 
-            cos(alpha_target) = mdot*sqrt(Tt) / (mf_term * Pt * A_exit * q(lam))
-            => A_exit_required = mdot*sqrt(Tt) / (mf_term * Pt * q(lam) * cos(alpha_target))
+                cos(alpha_target) = mdot*sqrt(Tt) / (mf_term*Pt*A_exit*q(lam))
+                => A_exit_required = mdot*sqrt(Tt) / (mf_term*Pt*q(lam)*cos(alpha_target))
 
-        beta2_metal is then found with brentq so that axial_exit_area_nb(blade)
-        equals A_exit_required. The lower bracket is beta2_geometric =
-        arccos(o/pitch) — the passage cannot be tighter than the throat.
-        At convergence: beta2_metal > beta2_flow_actual (metal is more closed
-        than the flow angle, as expected for supersonic expansion).
+              The exit annulus (Ro_out/Ri_out at fixed Rm) is resized to
+              deliver A_exit_required.
+
+          (2) The blade METAL angle is a separate, more-closed angle set by
+              the throat itself: o = pitch*cos(beta2_metal) at the critical
+              (Mach 1) condition. Downstream unguided supersonic expansion
+              relaxes the flow from that throat angle to the less-turned
+              beta2_flow by the exit — beta2_metal is therefore NOT equal to
+              beta2_flow. It's recovered from a bracketed root-find on the
+              throat's mass-flow continuity, self-consistent with the
+              blade's axial throat location (a naive Picard iteration on
+              this o <-> beta2_metal coupling is a stable limit cycle).
     """
     Rm      = kin['Rm']
     mdot_kg = kin['mdot_kg']
@@ -780,6 +788,8 @@ def _build_blade_geometry(
             lam_exit   = states['lam_C2']
             gamma_exit = states['gamma2']
             R_exit     = states['R2']
+            gamma_in   = states['gamma1']
+            R_in       = states['R1']
             Ps_exit    = states['Ps2']
             Pt_row     = float(kin['Pt0'].to('Pa').magnitude)
             Tt_row     = float(kin['Tt0'].to('K').magnitude)
@@ -801,6 +811,8 @@ def _build_blade_geometry(
             lam_exit   = states['lam_W3']
             gamma_exit = states['gamma3']
             R_exit     = states['R3']
+            gamma_in   = states['gamma2']
+            R_in       = states['R2']
             Ps_exit    = states['Ps3']
             Pt_row     = states['Pt2_rel']
             Tt_row     = states['Tt2_rel']
@@ -821,29 +833,49 @@ def _build_blade_geometry(
         tb2   = np.tan(np.radians(beta2_flow))
         cb2   = np.cos(np.radians(beta2_flow))
         pitch = Z_tgt * Cax / (2.0 * (tb1 + tb2) * cb2**2)
-        N     = max(int(round(2 * np.pi * Rm / pitch)), 3)
-        pitch = 2 * np.pi * Rm / N
+        _N_forced = N_rotor if is_rotor else N_stator
+        N     = _N_forced if _N_forced is not None else max(int(round(2 * np.pi * Rm / pitch)), 3)
+        # Pitch from here on feeds the geometric identity o = pitch*cos(beta2)
+        # used in the deviation/gauging-angle calcs below, which must pair
+        # with the exit annulus AREA formula (pi*(Ro^2-Ri^2) = 2*pi*b*Rm_arith,
+        # exact algebra) -- so it needs the ARITHMETIC mean of the actual exit
+        # annulus radii, not kin['Rm'] (which _size_annulus constructs to be
+        # the RMS mean of Ro/Ri by construction: Ro^2=Rm^2+half, Ri^2=Rm^2-half
+        # -> (Ro^2+Ri^2)/2=Rm^2 exactly). Using kin['Rm'] here breaks the
+        # o=pitch*cos(beta2) <-> A_throat identity the same way mean_radius()
+        # broke it in off_design.py's deviation() (see that fix). N (blade
+        # count, from Zweifel loading) is left on kin['Rm'] -- that's a
+        # legitimate, separate "representative radius" convention.
+        Rm_arith_out = 0.5 * (Ro_out + Ri_out)
+        pitch = 2 * np.pi * Rm_arith_out / N
 
         # ── Polytropic exponent ───────────────────────────────────────────
-        Pt_out = Pt_row * r_loss
-        gm1    = gamma_exit - 1.0
-        gp1    = gamma_exit + 1.0
+        # n_poly characterizes entropy generation relative to the INLET
+        # reference state (matches off_design.py's blade_passage_new, which
+        # uses inlet gamma for this same reason).
+        Pt_out  = Pt_row * r_loss
+        gm1_in  = gamma_in - 1.0
         if Pt_row / Ps_exit > 1.0 and Pt_out / Ps_exit > 1.0 and r_loss < 1.0:
-            n_over_nm1 = ((gamma_exit / gm1)
+            n_over_nm1 = ((gamma_in / gm1_in)
                           * np.log(Pt_row / Ps_exit)
                           / np.log(Pt_out / Ps_exit))
             n_poly = float(np.clip(n_over_nm1 / (n_over_nm1 - 1.0),
-                                   1.01, gamma_exit))
+                                   1.01, gamma_in))
         else:
-            n_poly = gamma_exit
+            n_poly = gamma_in
 
-        lam_crit_val = lam_crit_polytropic(n_poly, gamma_exit)
+        lam_crit_val = lam_crit_polytropic(n_poly, gamma_in)
 
         # ── Mass flow function ────────────────────────────────────────────
-        mf_term = np.sqrt((gamma_exit / R_exit) * (2.0 / gp1) ** (gp1 / gm1))
+        gp1_in = gamma_in + 1.0
+        mf_term_in = np.sqrt((gamma_in / R_in) * (2.0 / gp1_in) ** (gp1_in / gm1_in))
 
         # ── Inlet metal angle ─────────────────────────────────────────────
-        beta1_metal = beta1_flow
+        # des_incidence_r [deg] offsets the rotor metal angle from α₁(des).
+        # incidence_moustapha then uses blade["i_des"] to recover i_eff per
+        # Moustapha (1989) Fig.1: i_eff = α₁ - α₁(des) = (α₁ - β₁) - i_des.
+        _i_des = des_incidence_r if is_rotor else 0.0
+        beta1_metal = beta1_flow - _i_des
 
         # =====================================================================
         # THROAT AND METAL ANGLE
@@ -852,109 +884,194 @@ def _build_blade_geometry(
         if lam_exit >= lam_crit_val:
             # ── SUPERSONIC / CHOKED ──────────────────────────────────────────
             #
-            # Step 1: pin o from mass-flow continuity at critical conditions.
-            A_throat_total = (mdot_kg * np.sqrt(Tt_row)) / (mf_term * Pt_row)
-            o = A_throat_total / (N * span_out)
-            if o > pitch:
-                N     = max(int(np.floor(
-                            A_throat_total / (0.95 * span_out * pitch))), 3)
-                pitch = 2 * np.pi * Rm / N
-                o     = A_throat_total / (N * span_out)
-            o = max(o, 1e-5)
+            # Two independent constraints:
+            #  (1) Exit continuity at the TARGET flow angle fixes the required
+            #      exit-annulus area (mdot, q_n(lam_exit), cos(beta2_flow) are
+            #      all fixed — nothing here depends on the blade angle, since
+            #      sup_deviation()'s mdot_choke branch only sees the exit area).
+            #      Resize Ro_out/Ri_out (fixed Rm) directly, closed-form.
+            #  (2) The blade METAL angle is a different, more-closed angle set
+            #      by the throat itself (o = pitch*cos(beta2_metal) at the
+            #      critical/M=1 condition) — downstream unguided supersonic
+            #      expansion relaxes the flow from that throat angle to the
+            #      less-turned target beta2_flow by the exit. beta2_metal is
+            #      therefore NOT equal to beta2_flow; it's recovered from the
+            #      throat geometry instead.
+            #
+            # (2) couples o <-> beta2_metal through the blade-shape-dependent
+            # throat location (stagger/x_frac), which is a stable period-8
+            # limit cycle under naive Picard iteration (confirmed by direct
+            # testing) — so it's solved with a bracketed root-find instead.
+            #
+            # Note: Step 5 (below) is NOT an independent check on Step 1 —
+            # both solve the exact same continuity equation for the exact
+            # same (mdot_kg, Pt_row, Tt_row, gamma_in, n_poly), just inverted
+            # (Step 1: area from angle; Step 5: angle from that same area),
+            # so beta2_flow_actual == beta2_flow always, by construction
+            # (confirmed empirically — an iterative feedback loop here was
+            # tried and verified to be a no-op). The real FD-vs-OD mass-flow
+            # gap seen in cross-checks traces to off_design.py's independent
+            # solve converging its own r_loss/n_poly/mdot_choke anchor at a
+            # slightly different point than this design calculation, not to
+            # anything in this sizing step.
 
-            # Step 2: geometric lower bound for beta2_metal
-            beta2_geometric = np.degrees(np.arccos(np.clip(o / pitch, 0.0, 1.0)))
-
-            # Step 3: back-calculate A_exit_required from target flow angle.
-            # From sup_deviation:
-            #   cos(alpha) = mdot*sqrt(Tt) / (mf_term * Pt * A_exit * q_n(lam))
-            q_n_out         = q_n_func(lam_exit, n_poly, gamma_exit)
+            # ── (1) Exit annulus resize ──────────────────────────────────────
+            q_n_out         = q_n_func(lam_exit, n_poly, gamma_in)
             cos_alpha_tgt   = np.cos(np.radians(beta2_flow))
             A_exit_required = (mdot_kg * np.sqrt(Tt_row)) / \
-                               (mf_term * Pt_row * q_n_out * cos_alpha_tgt)
+                            (mf_term_in * Pt_row * q_n_out * cos_alpha_tgt)
 
-            # Step 4: find beta2_metal via brentq so axial_exit_area_nb = A_exit_required.
-            def _make_tmp(b2m):
-                return {
-                    'Beta_1':     Q_(beta1_metal, 'deg'),
-                    'Beta_2':     Q_(b2m,         'deg'),
-                    'throat':     Q_(o,            'm'),
-                    'Blade_N':    N,
-                    'Chord_ax':   Q_(Cax,          'm'),
-                    'R_o_outlet': Q_(Ro_out,       'm'),
-                    'R_i_outlet': Q_(Ri_out,       'm'),
-                    'R_o_inlet':  Q_(Ro_in,        'm'),
-                    'R_i_inlet':  Q_(Ri_in,        'm'),
-                    'inlet_wedge': inlet_wedge,
-                    'exit_wedge': exit_wedge,
-                    'zeta_ung':   zeta_ung,
-                    'TE_radius':  TE_radius,
-                    'LE_radius':  LE_radius,
-                    'stagger':    Q_(np.degrees(np.arctan(
-                                      (np.tan(np.radians(beta1_metal))
-                                       + np.tan(np.radians(b2m))) / 2.0)),
-                                      'deg'),
-                    'rotating':   is_rotor,
-                }
+            half_exit = A_exit_required / (2.0 * np.pi)
+            if Rm**2 <= half_exit:
+                raise ValueError(
+                    f"Choked {row_name} exit annulus infeasible: "
+                    f"Rm^2={Rm**2:.4e} <= A_exit/(2*pi)={half_exit:.4e}")
+            Ro_out   = np.sqrt(Rm**2 + half_exit)
+            Ri_out   = np.sqrt(Rm**2 - half_exit)
+            span_out = Ro_out - Ri_out
 
-            def area_residual(b2m):
-                A = float(axial_exit_area_nb(_make_tmp(b2m)).to('m**2').magnitude)
-                return A - A_exit_required
+            # ── (2) Throat self-consistency: o <-> beta2_metal ───────────────
+            q_n_crit       = q_n_func(lam_crit_val, n_poly, gamma_in)
+            A_throat_total = (mdot_kg) / (q_n_crit * (Pt_row/np.sqrt(Tt_row)) * mf_term_in)
 
+            TE      = TE_radius.to('m').magnitude
+            ew_rad  = float(exit_wedge.to('rad').magnitude)
+            zeta_rad = float(zeta_ung.to('rad').magnitude)
+
+            def _span_throat_of_o(o_val):
+                beta2_m_deg = np.degrees(np.arccos(np.clip(o_val / pitch, 0.0, 1.0)))
+                params = dict(
+                    LE_radius   = LE_radius,
+                    TE_radius   = TE_radius,
+                    Chord_ax    = Q_(Cax,              'm'),
+                    zeta_ung    = zeta_ung,
+                    beta_in     = Q_(beta1_metal,      'deg'),
+                    beta_out    = Q_(-abs(beta2_m_deg), 'deg'),
+                    inlet_wedge = inlet_wedge,
+                    exit_wedge  = exit_wedge,
+                    N_blades    = N,
+                    throat      = Q_(o_val,            'm'),
+                    Radius      = Q_(Rm,               'm'),
+                )
+                _, _, _, extra = build_pritchard_profile(params, n=40)
+                stagger_rad = extra['stagger_angle']
+                beta_2_rad  = np.radians(beta2_m_deg) - ew_rad + stagger_rad
+                x_2    = Cax - TE + (o_val + TE) * np.sin(beta_2_rad)
+                x_frac = float(np.clip(x_2 / Cax, 0.0, 1.0))
+                return span_in + x_frac * (span_out - span_in), beta2_m_deg
+
+            def _throat_residual(o_val):
+                span_throat, _ = _span_throat_of_o(o_val)
+                return o_val - A_throat_total / (N * span_throat)
+
+            o_lo, o_hi = 1e-6, pitch * 0.999
             try:
-                lo   = beta2_geometric
-                hi   = 89.0
-                f_lo = area_residual(lo)
-                f_hi = area_residual(hi)
+                f_lo, f_hi = _throat_residual(o_lo), _throat_residual(o_hi)
                 if f_lo * f_hi < 0.0:
-                    beta2_metal = brentq(area_residual, lo, hi, xtol=1e-4)
+                    o_new = brentq(_throat_residual, o_lo, o_hi, xtol=1e-9)
                 else:
-                    # A_exit_required outside achievable range — use geometric
-                    beta2_metal = beta2_geometric
+                    o_new = A_throat_total / (N * span_out)   # fallback: nominal span
             except Exception:
-                beta2_metal = beta2_geometric
+                o_new = A_throat_total / (N * span_out)
 
-            # Step 5: verify with sup_deviation
-            blade_tmp         = _make_tmp(beta2_metal)
+            o = max(o_new, 1e-5)
+            _, beta2_metal  = _span_throat_of_o(o)
+            beta2_geometric = beta2_metal
+
+            # Step 5: verify with sup_deviation — pass design mdot_choke explicitly
+            # so the throat area is consistent with A_throat_total sizing above.
+            blade_tmp = {
+                'Beta_1':     Q_(beta1_metal, 'deg'),
+                'Beta_2':     Q_(beta2_metal, 'deg'),
+                'throat':     Q_(o_new,       'm'),
+                'Blade_N':    N,
+                'Chord_ax':   Q_(Cax,         'm'),
+                'R_o_outlet': Q_(Ro_out,      'm'),
+                'R_i_outlet': Q_(Ri_out,      'm'),
+                'R_o_inlet':  Q_(Ro_in,       'm'),
+                'R_i_inlet':  Q_(Ri_in,       'm'),
+                'inlet_wedge': inlet_wedge,
+                'exit_wedge': exit_wedge,
+                'zeta_ung':   zeta_ung,
+                'TE_radius':  TE_radius,
+                'LE_radius':  LE_radius,
+                'stagger':    Q_(np.degrees(np.arctan(
+                                (np.tan(np.radians(beta1_metal))
+                                + np.tan(np.radians(beta2_metal))) / 2.0)),
+                                'deg'),
+                'rotating':   is_rotor,
+            }
             beta2_flow_actual = float(sup_deviation(
                 blade_tmp, lam_exit,
                 Pt_row, Tt_row,
-                gamma_exit, R_exit, n_poly,
+                gamma_in, R_in, n_poly,
+                mdot_choke=mdot_kg,
             ).to('deg').magnitude)
 
             # Physical check: metal should be more closed than flow
             # (beta2_metal > beta2_flow_actual for supersonic expansion)
             delta_final = beta2_metal - beta2_flow_actual
+            _throat_infeasible = False
 
         else:
             # ── SUBSONIC ─────────────────────────────────────────────────────
             # Iterate beta2_metal via _delta_from_geometry until converged.
+            # o = pitch*cos(beta2_metal) is a GEOMETRIC IDENTITY, not two
+            # independent quantities — beta2_metal is the only free variable
+            # here, o is always derived from it. (Clamping o directly, as an
+            # earlier version of this code did, breaks that identity: o stops
+            # equaling pitch*cos(beta2_metal), so beta2_metal_new = beta2_flow
+            # + delta no longer means anything, and produces a self-
+            # inconsistent, meaningless "deviation" on read-back.)
+            #
+            # o can never legitimately fall below the CHOKED throat area (same
+            # q_n_crit/A_throat_total formula the supersonic branch uses) — a
+            # smaller throat couldn't pass mdot_kg without choking. Enforce
+            # this by capping beta2_metal itself at the angle that makes
+            # o == o_choked_min, so o stays self-consistent with beta2_metal
+            # at every step. If the search saturates at this ceiling, the
+            # target beta2_flow is genuinely infeasible for this throat/mass
+            # flow/annulus combination — not a bug, real information — so the
+            # resulting (honest, self-consistent) deviation is large and gets
+            # flagged rather than silently absorbed.
+            q_n_crit_sub   = q_n_func(lam_crit_val, n_poly, gamma_in)
+            A_throat_total_sub = (mdot_kg) / (q_n_crit_sub * (Pt_row/np.sqrt(Tt_row)) * mf_term_in)
+            o_choked_min   = A_throat_total_sub / (N * span_in)
+            beta2_metal_ceiling = np.degrees(np.arccos(
+                np.clip(o_choked_min / pitch, -1.0, 1.0)))
+
             beta2_metal = beta2_flow
 
             for dev_iter in range(40):
                 o_current = pitch * np.cos(np.radians(beta2_metal))
-                o_current = max(o_current, 1e-5)
 
                 delta = _delta_from_geometry(
-                    o_current, pitch, lam_exit, lam_crit_val)
+                    o_current, pitch, lam_exit, gamma_exit, lam_crit_val)
 
-                beta2_metal_new = beta2_flow + delta
+                beta2_metal_new = min(beta2_flow + delta, beta2_metal_ceiling)
 
                 if abs(beta2_metal_new - beta2_metal) < 0.005:
                     beta2_metal = beta2_metal_new
-                    o           = o_current
+                    o           = pitch * np.cos(np.radians(beta2_metal))
                     break
 
                 beta2_metal = beta2_metal_new
-                o           = o_current
+                o           = pitch * np.cos(np.radians(beta2_metal))
             else:
                 o = pitch * np.cos(np.radians(beta2_metal))
 
             o = max(o, 1e-5)
 
-            Mw2               = lambda_to_mach(lam_exit, gamma_exit)
+            _throat_infeasible = beta2_metal >= beta2_metal_ceiling - 1e-6
+            if _throat_infeasible:
+                print(f"  ⚠  {row_name}: target flow angle "
+                      f"({beta2_flow:.2f} deg) infeasible with a "
+                      f"choke-consistent throat -- capped at "
+                      f"beta2_metal={beta2_metal_ceiling:.2f} deg "
+                      f"(o_choked_min={o_choked_min*1000:.4f}mm)")
+
             alpha_out_val     = float(deviation_raw(
-                o, pitch, Mw2, gamma_exit, 1.0).to('deg').magnitude)
+                o, pitch, lam_exit, gamma_exit, lam_crit_val).to('deg').magnitude)
             delta_final       = beta2_metal - alpha_out_val
             beta2_flow_actual = alpha_out_val
 
@@ -995,9 +1112,16 @@ def _build_blade_geometry(
                  + np.tan(np.radians(beta2_metal))) / 2.0)
 
         # ── Assemble blade dict ───────────────────────────────────────────
+        # For supersonic blades store the design choked mass flow so that
+        # sup_deviation can use the exact throat mdot rather than the
+        # A_exit*(o/t) approximation which conflates span_throat with span_exit.
+        mdot_choke_design = (Q_(mdot_kg, 'kg/s')
+                             if lam_exit >= lam_crit_val else None)
+
         blade = {
             "Beta_1":     Q_(beta1_metal,             'deg'),
             "Beta_2":     Q_(beta2_metal,             'deg'),
+            "i_des":      Q_(_i_des,                  'deg'),
             "stagger":    Q_(np.degrees(stagger_rad), 'deg'),
             "throat":     Q_(o,                       'm'),
             "TE_radius":  TE_radius,
@@ -1013,6 +1137,7 @@ def _build_blade_geometry(
             "inlet_wedge": inlet_wedge,
             "exit_wedge": exit_wedge,
             "zeta_ung":   zeta_ung,
+            "mdot_choke_design": mdot_choke_design,
             # ── Diagnostics ──────────────────────────────────────────────
             "_throat_mm":          o * 1000,
             "_pitch_mm":           pitch * 1000,
@@ -1031,6 +1156,7 @@ def _build_blade_geometry(
             "_beta2_geometric":    float(beta2_geometric) if lam_exit >= lam_crit_val else float(beta2_metal),
             "_stagger_deg":        np.degrees(stagger_rad),
             "_Zweifel":            2 * (pitch / Cax) * (tb1 + tb2) * cb2**2,
+            "_throat_infeasible":  _throat_infeasible,
         }
 
         results[row_name] = blade
@@ -1078,6 +1204,7 @@ def _build_state_dicts(kin, states):
         "Ts":       Q_(states['Ts2'],    'K'),
         "Cm":       Q_(Cm,               'm/s'),
         "lam_exit": states['lam_C2'],
+        "M_exit":   lambda_to_mach(states['lam_C2'], states['gamma2']),
         "gamma":    states['gamma2'],
         "R":        Q_(states['R2'],     'J/kg/K'),
         "Pt_rel":   Q_(states['Pt2'],    'Pa'),
@@ -1104,6 +1231,7 @@ def _build_state_dicts(kin, states):
         "Ts":       Q_(states['Ts3'],      'K'),
         "Cm":       Q_(kin['C3'],         'm/s'),
         "lam_exit": states['lam_W3'],
+        "M_exit":   lambda_to_mach(states['lam_W3'], states['gamma3']),
         "gamma":    states['gamma3'],
         "R":        Q_(states['R3'],       'J/kg/K'),
         "Pt_rel":   Q_(states['Pt3_rel'],  'Pa'),
@@ -1167,6 +1295,333 @@ def _compute_eta(kin, states, gas, composition):
     }
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DESIGN-POINT VERIFICATION
+#  forward_design() sizes geometry from an assumed, fixed kinematic velocity
+#  triangle (see _walk_thermo) — it never checks that assumption against real
+#  continuity through the blade it builds. off_design.py's
+#  build_performance_curve_moffitt is the rigorous engine that does: given the
+#  ACTUAL finished geometry and a boundary condition, solve for what the flow
+#  really does. This function finds the rotor-exit static back-pressure (p2)
+#  that makes that rigorous, independent evaluation deliver the power
+#  forward_design() was actually asked to build (mdot_kg * target specific
+#  work) — i.e. it answers "does the finished hardware, analyzed for real,
+#  deliver its design brief" rather than trusting forward_design's own
+#  simplified numbers.
+# ═══════════════════════════════════════════════════════════════════════════════
+def _evaluate_od_point(design, gas, composition, RPM, inlet, p2_mag,
+                       sweep_from_pr=1.3, n_sweep=25):
+    """
+    Run off-design's rigorous engine (build_performance_curve_moffitt) for the
+    finished forward_design() geometry at a specific rotor-exit static
+    back-pressure p2 [Pa].
+
+    Solving directly AT p2_mag from a single, generically-seeded warm start
+    is unreliable: build_performance_curve_moffitt's choke-mode/mdot_frozen
+    bookkeeping can converge to a spurious branch far from what a plain,
+    direct fsolve on the same ms=mr equation finds (confirmed directly —
+    same geometry, same p2, same physics, very different answer depending on
+    how p1 was seeded). Sweeping a full p2 array from a safely-unchoked,
+    low-PR starting point down to p2_mag and taking the LAST (sequentially
+    warm-started) point reuses the same warm-start mechanism the production
+    Step-5 sweep already uses successfully, and lands on the same, correct
+    branch instead.
+    """
+    stator, rotor = design['stator'], design['rotor']
+    Tt_in = float(inlet['Tt'].to('K').magnitude)
+    Pt_in = float(inlet['Pt'].to('Pa').magnitude)
+
+    Ps3_des = design['states']['Ps3']
+    Pt3_des = design['perf']['Pt3_abs']
+    ps_pt   = Ps3_des / Pt3_des
+    p2_hi   = max(Pt_in / sweep_from_pr * ps_pt, p2_mag * 1.01)
+    p2_arr  = np.linspace(p2_hi, p2_mag, max(n_sweep - 1, 1))
+    p2_arr  = np.sort(np.unique(np.append(p2_arr, p2_mag)))[::-1]
+
+    gas.TPX = Tt_in, Pt_in, composition
+    with contextlib.redirect_stdout(io.StringIO()):
+        curve = build_performance_curve_moffitt(
+            stator, rotor, inlet, gas, composition, RPM,
+            list(p2_arr), len(p2_arr))
+    if not curve:
+        raise ValueError(
+            f"Off-design sweep produced no converged point down to "
+            f"p2={p2_mag:.1f} Pa")
+    pt = curve[-1]
+    mdot = pt['mdot']
+    Pt3_abs = float(pt['rotor_out']['Pt_abs'].to('Pa').magnitude)
+    gas.TPX = Tt_in, Pt_in, composition
+    ht_in = gas.enthalpy_mass
+    s_in  = gas.entropy_mass
+    gas.SP = s_in, Pt3_abs
+    ht_is = gas.enthalpy_mass
+    dh_is  = ht_in - ht_is
+    dh_act = pt['eta'] * dh_is
+    return dict(p2=p2_mag, mdot=mdot, eta=pt['eta'], PR=pt['PR'],
+                dh_act=dh_act, power_W=mdot * dh_act, od_point=pt)
+
+
+def evaluate_at_same_p2(design, gas, composition, RPM, inlet, p2_mag=None):
+    """
+    Evaluate off-design's rigorous engine at the SAME static back-pressure
+    forward_design() itself assumed (design['states']['Ps3']), rather than
+    searching for a p2 that matches power.
+
+    This is the more physically apt comparison for isolating a genuine
+    continuity/state mismatch: p2 is the actual downstream boundary
+    condition (the "potential for expansion") the blade sees. Holding it
+    fixed at forward-design's own assumed value means any resulting
+    mdot/power/eta difference is caused purely by the fact that the blade's
+    real continuity-derived state differs from forward-design's assumed
+    velocity triangle — not by comparing two different operating points.
+
+    Returns None if that back-pressure lands in an unstable/non-converging
+    branch (rare — see off_design.py's rotor-choke-onset region); caller can
+    retry with an explicit p2_mag nearby.
+    """
+    if p2_mag is None:
+        p2_mag = design['states']['Ps3']
+    try:
+        return _evaluate_od_point(design, gas, composition, RPM, inlet, p2_mag)
+    except Exception:
+        return None
+
+
+def verify_design_point(design, gas, composition, RPM, inlet, pwr_W,
+                        frac_lo=0.80, frac_hi=1.05, n_probe=30):
+    """
+    design : dict returned by forward_design()
+    inlet  : {"Pt": Q_, "Tt": Q_} — same cycle inlet conditions used to build
+             the design
+    pwr_W  : target shaft power [W] — the actual input forward_design() was
+             given (mdot * delta_H), not a cycle-level PR/eta target
+
+    Returns a dict (p2, mdot, eta, PR, power_W) at the power-matched
+    operating point, or None if no sign change was found in the probed range
+    (widen frac_lo/frac_hi and retry).
+    """
+    p2_center = design['states']['Ps3']
+
+    def eval_p2(p2_mag):
+        return _evaluate_od_point(design, gas, composition, RPM, inlet, p2_mag)
+
+    probes = []
+    for frac in np.linspace(frac_hi, frac_lo, n_probe):
+        try:
+            probes.append((frac, eval_p2(p2_center * frac)))
+        except Exception:
+            continue  # some fracs land in an unstable choked/cold-start branch
+
+    for (f1, r1), (f2, r2) in zip(probes, probes[1:]):
+        resid1 = r1['power_W'] - pwr_W
+        resid2 = r2['power_W'] - pwr_W
+        if resid1 * resid2 < 0:
+            p2_sol = brentq(lambda p2: eval_p2(p2)['power_W'] - pwr_W,
+                            p2_center * f1, p2_center * f2, xtol=1.0)
+            return eval_p2(p2_sol)
+
+    return None
+
+
+def print_verified_design_point(design, verified, pwr_W, mdot_kg):
+    """Print forward-design's own numbers alongside the power-verified,
+    off-design-confirmed operating point, side by side."""
+    perf = design['perf']
+    sep = '─' * 66
+    print(f"\n{sep}")
+    print(f"  VERIFIED TURBINE DESIGN POINT")
+    print(f"{sep}")
+    print(f"  {'Quantity':<22} {'Forward-design':>16} {'Verified (off-design)':>22}")
+    print(f"  {'-'*62}")
+    if verified is None:
+        print(f"  No power-matching p2 found in the probed range — "
+              f"widen frac_lo/frac_hi in verify_design_point().")
+        print(f"{sep}\n")
+        return
+    print(f"  {'mdot [kg/s]':<22} {mdot_kg:>16.4f} {verified['mdot']:>22.4f}")
+    print(f"  {'Power [MW]':<22} {pwr_W/1e6:>16.4f} {verified['power_W']/1e6:>22.4f}")
+    print(f"  {'PR (tt)':<22} {perf['Pt_ratio']:>16.4f} {verified['PR']:>22.4f}")
+    print(f"  {'eta_tt [%]':<22} {perf['eta_tt']*100:>16.3f} {verified['eta']*100:>22.3f}")
+    print(f"  {'-'*62}")
+    print(f"  Power delta   = {(verified['power_W']-pwr_W)/1e6:+.4f} MW "
+          f"({100*(verified['power_W']-pwr_W)/pwr_W:+.3f}%)")
+    print(f"  p2 (verified) = {verified['p2']:.1f} Pa   "
+          f"(forward-design's own Ps3 = {design['states']['Ps3']:.1f} Pa, "
+          f"{100*(verified['p2']-design['states']['Ps3'])/design['states']['Ps3']:+.3f}%)")
+    print(f"{sep}\n")
+
+
+def print_same_p2_point(design, result, mdot_kg):
+    """
+    Print forward-design's own numbers alongside off-design's rigorous
+    evaluation at the IDENTICAL static back-pressure (same p2 = same
+    downstream expansion potential) — no power-matching search involved.
+    Any mdot/power/eta difference reflects a genuine continuity/state
+    mismatch under matched physics, not a different operating point.
+    """
+    perf = design['perf']
+    sep = '─' * 66
+    print(f"\n{sep}")
+    print(f"  SAME-p2 COMPARISON  (both sides evaluated at p2 = {design['states']['Ps3']:.1f} Pa)")
+    print(f"{sep}")
+    print(f"  {'Quantity':<22} {'Forward-design':>16} {'Off-design':>22}")
+    print(f"  {'-'*62}")
+    if result is None:
+        print(f"  Off-design failed to converge at forward-design's own p2 — "
+              f"this p2 may sit in an unstable/non-converging branch "
+              f"(see off_design.py's rotor-choke-onset region).")
+        print(f"{sep}\n")
+        return
+    pwr_fd = design['perf']['dh_act'] * mdot_kg
+    print(f"  {'mdot [kg/s]':<22} {mdot_kg:>16.4f} {result['mdot']:>22.4f}")
+    print(f"  {'Power [MW]':<22} {pwr_fd/1e6:>16.4f} {result['power_W']/1e6:>22.4f}")
+    print(f"  {'PR (tt)':<22} {perf['Pt_ratio']:>16.4f} {result['PR']:>22.4f}")
+    print(f"  {'eta_tt [%]':<22} {perf['eta_tt']*100:>16.3f} {result['eta']*100:>22.3f}")
+    print(f"  {'-'*62}")
+    print(f"  mdot delta  = {(result['mdot']-mdot_kg):+.4f} kg/s "
+          f"({100*(result['mdot']-mdot_kg)/mdot_kg:+.3f}%)")
+    print(f"  Power delta = {(result['power_W']-pwr_fd)/1e6:+.4f} MW "
+          f"({100*(result['power_W']-pwr_fd)/pwr_fd:+.3f}%)")
+    print(f"{sep}\n")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  FD vs OD — STATION-BY-STATION DIAGNOSTIC
+#  forward_design() assumes a fixed kinematic velocity triangle (_walk_thermo);
+#  off-design (build_performance_curve_moffitt) solves the same finished blade
+#  geometry rigorously from continuity. Both sides run the SAME
+#  compute_blade_losses() model on their own state, so any zeta/eta gap here
+#  traces to a genuine state difference (Mach, angle, pressure) — not the loss
+#  correlations themselves. Uses verify_design_point()'s od_point so both
+#  sides are compared at the identical, power-matched operating point.
+# ═══════════════════════════════════════════════════════════════════════════════
+def compare_fd_od(design, kin, verified):
+    if verified is None or 'od_point' not in verified:
+        print("  No verified operating point available — run verify_design_point() first.")
+        return
+
+    od = verified['od_point']
+    fd_s_in, fd_s_out, fd_r_in, fd_r_out = _build_state_dicts(kin, design['states'])
+    od_s_out, od_r_in, od_r_out = od['stator_out'], od['rotor_in'], od['rotor_out']
+
+    stator, rotor = design['stator'], design['rotor']
+    fd_loss_s, fd_loss_r = design['losses']['stator'], design['losses']['rotor']
+    od_loss_s, od_loss_r = od['loss_s'], od['loss_r']
+
+    def _rho(d):
+        R  = float(d['R'].to('J/kg/K').magnitude)
+        Ts = float(d['Ts'].to('K').magnitude)
+        Ps = float(d['Ps'].to('Pa').magnitude)
+        return Ps / (R * Ts)
+
+    def _mach_rel(d):
+        R     = float(d['R'].to('J/kg/K').magnitude)
+        gamma = float(d['gamma'])
+        Ts    = float(d['Ts'].to('K').magnitude)
+        W     = float(d['W'].to('m/s').magnitude)
+        return W / np.sqrt(gamma * R * Ts)
+
+    def _angle(d, swirl_key):
+        Cm = float(d['Cm'].to('m/s').magnitude)
+        sw = float(d[swirl_key].to('m/s').magnitude)
+        return float(np.degrees(np.arctan2(sw, Cm)))
+
+    rows = []   # (section, label, fd, od, fmt, unit)
+
+    def add(section, label, fd_val, od_val, fmt="{:.4f}", unit=""):
+        rows.append((section, label, fd_val, od_val, fmt, unit))
+
+    # ── Stator exit (absolute frame) ──────────────────────────────────────
+    add("STATOR EXIT (absolute)", "Ts",  design['states']['Ts2'],           float(od_s_out['Ts'].to('K').magnitude),  "{:.2f}", "K")
+    add("STATOR EXIT (absolute)", "Ps",  design['states']['Ps2']/1e3,       float(od_s_out['Ps'].to('Pa').magnitude)/1e3, "{:.3f}", "kPa")
+    add("STATOR EXIT (absolute)", "rho", design['states']['rho2'],          _rho(od_s_out), "{:.4f}", "kg/m3")
+    add("STATOR EXIT (absolute)", "C (abs vel)", kin['C2'],                 float(od_s_out['C'].to('m/s').magnitude), "{:.2f}", "m/s")
+    add("STATOR EXIT (absolute)", "alpha (flow angle)", kin['alpha2'],      float(od_s_out['alpha_out'].to('deg').magnitude), "{:.3f}", "deg")
+    add("STATOR EXIT (absolute)", "M (abs)", design['states']['M_C2'],      float(od_s_out['M_exit']), "{:.4f}", "")
+    add("STATOR EXIT (absolute)", "deviation (alpha - Beta_2 metal)",
+        kin['alpha2'] - float(stator['Beta_2'].to('deg').magnitude),
+        float(od_s_out['alpha_out'].to('deg').magnitude) - float(stator['Beta_2'].to('deg').magnitude),
+        "{:.3f}", "deg")
+
+    # ── Rotor inlet (relative frame) ──────────────────────────────────────
+    fd_beta_in = kin['beta2']
+    od_beta_in = _angle(od_r_in, 'W_theta')
+    add("ROTOR INLET (relative)", "Ts",  design['states']['Ts2'],           float(od_r_in['Ts'].to('K').magnitude), "{:.2f}", "K")
+    add("ROTOR INLET (relative)", "Ps",  design['states']['Ps2']/1e3,       float(od_r_in['Ps'].to('Pa').magnitude)/1e3, "{:.3f}", "kPa")
+    add("ROTOR INLET (relative)", "rho", design['states']['rho2'],          _rho(od_r_in), "{:.4f}", "kg/m3")
+    add("ROTOR INLET (relative)", "W (rel vel)", kin['W2'],                 float(od_r_in['W'].to('m/s').magnitude), "{:.2f}", "m/s")
+    add("ROTOR INLET (relative)", "beta_rel (flow angle)", fd_beta_in,       od_beta_in, "{:.3f}", "deg")
+    add("ROTOR INLET (relative)", "M (rel)", design['states']['M_W2'],      _mach_rel(od_r_in), "{:.4f}", "")
+    add("ROTOR INLET (relative)", "incidence (beta_rel - Beta_1 metal)",
+        fd_beta_in - float(rotor['Beta_1'].to('deg').magnitude),
+        od['i_rotor'], "{:.3f}", "deg")
+
+    # ── Rotor exit (relative frame) ─────────────────────────────────────────
+    # NOTE: kin['beta3'] is built from the "C_theta3=0 -> W_theta3=+U" axial-exit
+    # assumption (forced positive); blade_passage_new's raw W_theta at this
+    # station follows the opposite sign convention (-Cm*tan(alpha), standard
+    # Dixon turning direction). Same station, same physics, different sign
+    # bookkeeping -- compare magnitudes here to avoid a meaningless sign-flip
+    # artifact (rotor INLET above needs no such fix: both sides use W_theta =
+    # C_theta - U consistently there).
+    fd_beta_out = abs(kin['beta3'])
+    od_beta_out = abs(_angle(od_r_out, 'W_theta'))
+    add("ROTOR EXIT (relative)", "Ts",  design['states']['Ts3'],            float(od_r_out['Ts'].to('K').magnitude), "{:.2f}", "K")
+    add("ROTOR EXIT (relative)", "Ps",  design['states']['Ps3']/1e3,        float(od_r_out['Ps'].to('Pa').magnitude)/1e3, "{:.3f}", "kPa")
+    add("ROTOR EXIT (relative)", "rho", design['states']['rho3'],           _rho(od_r_out), "{:.4f}", "kg/m3")
+    add("ROTOR EXIT (relative)", "W (rel vel)", kin['W3'],                  float(od_r_out['W'].to('m/s').magnitude), "{:.2f}", "m/s")
+    add("ROTOR EXIT (relative)", "beta_rel (flow angle)", fd_beta_out,      od_beta_out, "{:.3f}", "deg")
+    add("ROTOR EXIT (relative)", "M (rel)", design['states']['M_W3'],       float(od_r_out['M_exit']), "{:.4f}", "")
+    add("ROTOR EXIT (relative)", "deviation (beta_rel - Beta_2 metal)",
+        fd_beta_out - float(rotor['Beta_2'].to('deg').magnitude),
+        od_beta_out - float(rotor['Beta_2'].to('deg').magnitude),
+        "{:.3f}", "deg")
+
+    # ── Loss breakdown — identical compute_blade_losses() keys both sides ──
+    for label, fdl, odl in [("STATOR LOSS", fd_loss_s, od_loss_s),
+                            ("ROTOR LOSS",  fd_loss_r, od_loss_r)]:
+        add(label, "zeta_profile+incidence (zeta_s)", fdl['zeta_s'], odl['zeta_s'], "{:.5f}", "")
+        add(label, "zeta_secondary/endwall (zeta_f)", fdl['zeta_f'], odl['zeta_f'], "{:.5f}", "")
+        add(label, "zeta_leakage (zeta_l)",           fdl['zeta_l'], odl['zeta_l'], "{:.5f}", "")
+        add(label, "zeta_total",                      fdl['zeta_tot'], odl['zeta_tot'], "{:.5f}", "")
+        add(label, "r_loss (Pt_out/Pt_in)",            fdl['r_loss_new'], odl['r_loss_new'], "{:.6f}", "")
+
+    # ── Print ────────────────────────────────────────────────────────────────
+    sep = '─' * 92
+    print(f"\n{sep}")
+    print(f"  FD vs OD — STATION-BY-STATION COMPARISON  "
+          f"(p2 = {verified['p2']:.0f} Pa, PR = {verified['PR']:.4f})")
+    print(sep)
+    print(f"  {'Quantity':<38} {'Fwd-Design':>12} {'Off-Design':>12} {'Delta':>12} {'Delta%':>9}")
+    print(f"  {'-'*88}")
+
+    last_section = None
+    biggest = None   # track largest |Delta%| among zeta rows for the summary
+    for section, label, fd_val, od_val, fmt, unit in rows:
+        if section != last_section:
+            print(f"  {section}")
+            last_section = section
+        d = od_val - fd_val
+        # incidence is targeted to des_incidence_r (0deg here) by design, so
+        # its FD baseline is ~0 -- a %-of-baseline is meaningless there, show
+        # degrees only. Deviation is a real aerodynamic quantity (not
+        # zero-by-design) so it keeps a normal % delta.
+        near_zero_by_design = label.startswith('incidence')
+        pct = (float('nan') if near_zero_by_design or abs(fd_val) <= 1e-12
+               else 100.0 * d / fd_val)
+        d_str = ('+' if d >= 0 else '') + fmt.format(d)
+        pct_str = "     n/a" if np.isnan(pct) else f"{pct:>+7.2f}%"
+        print(f"    {label:<36} {fmt.format(fd_val):>12} {fmt.format(od_val):>12} "
+              f"{d_str:>12} {pct_str:>9}")
+        if 'zeta_' in label and 'total' not in label and not np.isnan(pct):
+            if biggest is None or abs(pct) > abs(biggest[1]):
+                biggest = (f"{section}: {label}", pct)
+
+    print(f"  {'-'*88}")
+    if biggest is not None:
+        print(f"  Largest relative loss-term shift: {biggest[0]}  ({biggest[1]:+.1f}%)")
+    print(f"{sep}\n")
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  MAIN FORWARD DESIGN  —  outer r_loss iteration
@@ -1193,6 +1648,7 @@ def forward_design(
     tip_gap_stator = None,
     t_s_rotor      =   None,
     t_s_stator      =  None,
+    des_incidence_r  = 0.0,
     tol          = 1e-5,
     max_iter     = 40,
     verbose      = True,
@@ -1223,52 +1679,85 @@ def forward_design(
     stator_blade = rotor_blade = None
     states = annulus = loss_s = loss_r = perf = None
     err    = 1e6
-    # Blade geometry (N, Cax, throat, pitch) is frozen after this many iters.
-    # The 2-cycle is driven by integer blade-count N flipping between two values
-    # as r_loss nudges the annulus; once the annulus is roughly set (iter 3-4)
-    # there is no physics reason to keep re-discretising.
-    GEOM_FREEZE_ITER = 4
+    MAX_GEOM = 30         # outer geometry update cycles
+    MAX_FLOW = max_iter   # inner flow-convergence steps per geometry
+    # Blade-count oscillation detection: lock N only when a period-2 flip is seen.
+    # Locking at iter-0 (with the cold-start r_loss) picks the wrong N for most
+    # cells and forces 30+ cycles to converge.  Detecting the actual oscillation
+    # lets non-oscillating cells run at their natural 2–4 cycle rate.
+    _N_stator_locked = None
+    _N_rotor_locked  = None
+    _Ns_2ago = _Nr_2ago = None   # blade counts two iterations ago
+    _Ns_1ago = _Nr_1ago = None   # blade counts one iteration ago
 
-    for outer in range(max_iter):
+    # Geometry is rebuilt EVERY iteration from the current r_loss -- never
+    # held fixed while r_loss re-converges against a stale snapshot. Only the
+    # blade COUNT (N) is locked once a period-2 oscillation is detected
+    # (Zweifel-based N naturally flips between adjacent integers iteration to
+    # iteration otherwise); throat opening, angles, and annulus keep updating
+    # every step so the geometry has a chance to converge onto the same
+    # kinematic triangle the loss/state iteration is converging toward,
+    # instead of settling on r_loss stability alone while the geometry from
+    # several iterations ago is still what's actually in the blade dicts.
+    MAX_ITER = MAX_GEOM * MAX_FLOW
+    for iter_num in range(MAX_ITER):
 
-        # ── Thermodynamic walk with current losses ────────────────────────
+        # Update geometry with current r_loss
         gas.TPX = _mag(kin['Tt0'], 'K'), _mag(kin['Pt0'], 'Pa'), composition
         states  = _walk_thermo(kin, gas, r_loss_s, r_loss_r)
+        annulus = _size_annulus(kin, states, mdot_kg,
+                                stator_blade=stator_blade,
+                                rotor_blade=rotor_blade)
+        stator_blade, rotor_blade = _build_blade_geometry(
+            kin, states, annulus,
+            AR_stator, AR_rotor, Z_stator, Z_rotor,
+            LE_radius, TE_radius,
+            inlet_wedge, exit_wedge_s, exit_wedge_r,
+            zeta_ung_s, zeta_ung_r, tip_gap, tip_gap_stator,
+            t_s_rotor, t_s_stator,
+            des_incidence_r=des_incidence_r,
+            r_loss_s=r_loss_s, r_loss_r=r_loss_r,
+            build_pritchard=True,
+            N_stator=_N_stator_locked, N_rotor=_N_rotor_locked,
+        )
+        # Detect period-2 oscillation (same N seen two iterations ago) and lock.
+        # Stator and rotor are locked independently — gating both on a joint
+        # match let one row's chatter block the other row from ever locking
+        # even after its own count had already stabilized.
+        if _N_stator_locked is None:
+            Ns = stator_blade['Blade_N']
+            if _Ns_2ago is not None and Ns == _Ns_2ago:
+                _N_stator_locked = Ns
+            _Ns_2ago, _Ns_1ago = _Ns_1ago, Ns
+        if _N_rotor_locked is None:
+            Nr = rotor_blade['Blade_N']
+            if _Nr_2ago is not None and Nr == _Nr_2ago:
+                _N_rotor_locked = Nr
+            _Nr_2ago, _Nr_1ago = _Nr_1ago, Nr
 
-        # ── Annulus + blade geometry (frozen after GEOM_FREEZE_ITER) ─────
-        if outer < GEOM_FREEZE_ITER:
-            annulus = _size_annulus(kin, states, mdot_kg,
-                                    stator_blade=stator_blade,
-                                    rotor_blade=rotor_blade)
-            stator_blade, rotor_blade = _build_blade_geometry(
-                kin, states, annulus,
-                AR_stator, AR_rotor, Z_stator, Z_rotor,
-                LE_radius, TE_radius,
-                inlet_wedge, exit_wedge_s, exit_wedge_r,
-                zeta_ung_s, zeta_ung_r, tip_gap, tip_gap_stator,
-                t_s_rotor, t_s_stator,
-                r_loss_s=r_loss_s, r_loss_r=r_loss_r,
-                build_pritchard=False,
-            )
+        if verbose:
+            _os = float(stator_blade['throat'].to('mm').magnitude) if hasattr(stator_blade['throat'], 'to') else stator_blade['throat']*1000
+            _or = float(rotor_blade['throat'].to('mm').magnitude)  if hasattr(rotor_blade['throat'],  'to') else rotor_blade['throat']*1000
+            print(f"         geom:  N_s={stator_blade['Blade_N']}  "
+                  f"o_s={_os:.4f}mm  "
+                  f"N_r={rotor_blade['Blade_N']}  "
+                  f"o_r={_or:.4f}mm")
 
-        # ── Losses ────────────────────────────────────────────────────────
+        # Losses from the JUST-rebuilt geometry against the current states
         s_in, s_out, r_in, r_out = _build_state_dicts(kin, states)
-        loss_s = compute_blade_losses(stator_blade, s_in, s_out, gas, rpm=Q_(0, 'rpm'))
-        loss_r = compute_blade_losses(rotor_blade,  r_in, r_out, gas, rpm=RPM)
-
+        loss_s  = compute_blade_losses(stator_blade, s_in, s_out, gas, rpm=Q_(0, 'rpm'))
+        loss_r  = compute_blade_losses(rotor_blade,  r_in, r_out, gas, rpm=RPM)
         r_loss_s_new = float(loss_s['r_loss_new'])
         r_loss_r_new = float(loss_r['r_loss_new'])
-
-        err = max(abs(r_loss_s_new - r_loss_s),
-                  abs(r_loss_r_new - r_loss_r))
-        r_loss_r = r_loss_r_new
+        err     = max(abs(r_loss_s_new - r_loss_s),
+                      abs(r_loss_r_new - r_loss_r))
         r_loss_s = r_loss_s_new
+        r_loss_r = r_loss_r_new
 
-        # ── Efficiency ────────────────────────────────────────────────────
         perf = _compute_eta(kin, states, gas, composition=composition)
 
         if verbose:
-            print(f"  iter {outer+1:2d}  |  "
+            print(f"  iter {iter_num+1:2d}  |  "
                   f"r_s={r_loss_s:.6f}  r_r={r_loss_r:.6f}  |  "
                   f"err={err:.2e}  |  "
                   f"η_tt={perf['eta_tt']*100:.2f}%  "
@@ -1279,23 +1768,8 @@ def forward_design(
             converged = True
             break
 
-    # Final Pritchard profile build at converged geometry
-    annulus = _size_annulus(kin, states, mdot_kg,
-                            stator_blade=stator_blade,
-                            rotor_blade=rotor_blade)
-    stator_blade, rotor_blade = _build_blade_geometry(
-        kin, states, annulus,
-        AR_stator, AR_rotor, Z_stator, Z_rotor,
-        LE_radius, TE_radius,
-        inlet_wedge, exit_wedge_s, exit_wedge_r,
-        zeta_ung_s, zeta_ung_r, tip_gap, tip_gap_stator,
-        t_s_rotor, t_s_stator,
-        r_loss_s=r_loss_s, r_loss_r=r_loss_r,
-        build_pritchard=True,
-    )
-
     if not converged and verbose:
-        print(f"  forward_design did not converge in {max_iter} iterations (err={err:.2e})")
+        print(f"  forward_design did not converge in {MAX_ITER} iterations (err={err:.2e})")
 
     perf.update(dict(
         r_loss_s = r_loss_s,
@@ -1318,6 +1792,7 @@ def forward_design(
         perf      = perf,
         losses    = dict(stator=loss_s, rotor=loss_r),
         converged = converged,
+        err       = err,
     )
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2515,7 +2990,7 @@ def build_spanwise_profiles(design, kin, profiles_mid,
                 # Deviation magnitude (delta_true >= 0) using the same
                 # polytropic lam_crit as the midspan blade
                 alpha_out   = float(deviation_raw(
-                                        o_cur, pitch_R, M_exit,
+                                        o_cur, pitch_R, lam_exit,
                                         gamma_exit, lam_crit_val
                                     ).to('deg').magnitude)
                 beta_g_cur  = np.degrees(np.arccos(
@@ -2542,7 +3017,7 @@ def build_spanwise_profiles(design, kin, profiles_mid,
 
             # ── Final converged deviation (for diagnostics) ───────────────
             alpha_out_final = float(deviation_raw(
-                                        throat_R, pitch_R, M_exit,
+                                        throat_R, pitch_R, lam_exit,
                                         gamma_exit, lam_crit_val
                                     ).to('deg').magnitude)
             beta_g_final    = np.degrees(np.arccos(

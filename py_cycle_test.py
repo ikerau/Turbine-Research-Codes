@@ -45,6 +45,11 @@ A4_SCALARS   = list(np.linspace(0.80, 1.05, 30))
 FN_FRACTIONS = [0.80 ,0.90, 1.00]   # fractions of design thrust
 FN_DESIGN    = 11800.0                            # lbf
 
+# Newton convergence — tighten for publication, loosen for quick runs
+NEWTON_ATOL    = 1e-8
+NEWTON_RTOL    = 1e-8
+NEWTON_MAXITER = 60
+
 # Unit conversion factors
 LBM_S_TO_KG_S = 0.453592
 LBF_TO_KN     = 0.00444822
@@ -119,10 +124,10 @@ class Turbojet(pyc.Cycle):
             self.connect('shaft.pwr_net',   'balance.lhs:turb_PR')
 
         newton = self.nonlinear_solver = om.NewtonSolver()
-        newton.options['atol']             = 1e-6
-        newton.options['rtol']             = 1e-6
+        newton.options['atol']             = NEWTON_ATOL
+        newton.options['rtol']             = NEWTON_RTOL
         newton.options['iprint']           = 2
-        newton.options['maxiter']          = 15
+        newton.options['maxiter']          = NEWTON_MAXITER
         newton.options['solve_subsystems'] = True
         newton.options['max_sub_solves']   = 100
         newton.options['reraise_child_analysiserror'] = False

@@ -74,6 +74,11 @@ PSI_TO_KPA    = 6.89476
 DPQP_FIXED = 0.05
 DPQP_TOL   = 0.001
 MAX_OUTER  = 10
+
+# Newton convergence — tighten for publication, loosen for quick runs
+NEWTON_ATOL    = 1e-8
+NEWTON_RTOL    = 1e-8
+NEWTON_MAXITER = 60
 FN_COLORS  = {0.60: "seagreen", 0.70: "darkorange",
               0.80: "firebrick", 0.90: "mediumpurple", 1.00: "steelblue"}
 
@@ -361,14 +366,18 @@ def _make_turbojet_core(comp_map, turb_map):
         self.connect('ngv_calcs.W_cool', 'cool_fracs.W_ngv')
         self.connect('bld_calcs.W_cool', 'cool_fracs.W_bld')
         self.connect('comp.Fl_O:stat:W', 'cool_fracs.W_in')
-        self.connect('cool_fracs.frac_ngv', 'bld3.ngv_cool:frac_W')
-        self.connect('cool_fracs.frac_bld', 'bld3.bld_cool:frac_W')
+        # For OD (T4 free), cooling fracs are managed externally in solve_od_turbojet().
+        # Connecting them inside Newton creates a T4↑→frac↑→W↓→FAR↑→T4↑ instability.
+        design = self.options['design']
+        if design:
+            self.connect('cool_fracs.frac_ngv', 'bld3.ngv_cool:frac_W')
+            self.connect('cool_fracs.frac_bld', 'bld3.bld_cool:frac_W')
 
         newton = self.nonlinear_solver = om.NewtonSolver()
-        newton.options['atol']             = 1e-6
-        newton.options['rtol']             = 1e-6
+        newton.options['atol']             = NEWTON_ATOL
+        newton.options['rtol']             = NEWTON_RTOL
         newton.options['iprint']           = 2
-        newton.options['maxiter']          = 15
+        newton.options['maxiter']          = NEWTON_MAXITER
         newton.options['solve_subsystems'] = True
         newton.options['max_sub_solves']   = 100
         newton.options['reraise_child_analysiserror'] = False
@@ -467,6 +476,10 @@ def _make_turbojet_const_fn(cfg):
                             eq_units='inch**2', rhs_name='nozz_area_target')
             self.connect('balance.W',             'inlet.Fl_I:stat:W')
             self.connect('nozz.Throat:stat:area', 'balance.lhs:W')
+
+            self.set_order(['fc', 'inlet', 'comp', 'bld3', 'orifice', 'burner', 'turb',
+                            'nozz', 'shaft', 'perf',
+                            'ngv_calcs', 'bld_calcs', 'cool_fracs', 'balance'])
             super().setup()
 
     return TurbojetConstFn
@@ -600,7 +613,9 @@ def extract_design(prob, pt='DESIGN'):
         'Fn_design':      prob.get_val(f'{pt}.perf.Fn',           units='lbf')[0],
         'T3_design':      prob.get_val(f'{pt}.comp.Fl_O:tot:T',   units='degR')[0],
         'P3_design':      prob.get_val(f'{pt}.comp.Fl_O:tot:P',   units='lbf/inch**2')[0],
-        'T4_exit_design': prob.get_val(f'{pt}.turb.Fl_O:tot:T',   units='degR')[0],
+        'T4_exit_design':  prob.get_val(f'{pt}.turb.Fl_O:tot:T',   units='degR')[0],
+        'turb_PR_design':  prob.get_val(f'{pt}.turb.PR')[0],
+        'FAR':             prob.get_val(f'{pt}.balance.FAR')[0],
     }
 
 
@@ -625,6 +640,204 @@ def extract_od_point(prob, pt):
         'turb_Wp':   prob.get_val(f'{pt}.turb.Wp')[0],
         'T4_exit':   prob.get_val(f'{pt}.turb.Fl_O:tot:T', units='degR')[0],
     }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  TURBOSHAFT-STYLE OD CONVERGENCE HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+def is_physical_turbojet(r):
+    """Sanity-check that a converged OD result is physically plausible."""
+    try:
+        return (3.0   < r['pi_c']    < 50.0   and
+                1000. < r['Nmech']   < 20000.  and
+                1.05  < r['turb_PR'] < 15.0    and
+                200.  < r['T3'] * RANKINE_TO_K < 1200. and
+                r.get('TSFC', 0) > 0)
+    except (KeyError, TypeError):
+        return False
+
+
+def _safe_warm_tj(r, des, tol=0.30):
+    """Return r as warm-start only if converged and on same branch as des."""
+    if not r.get('converged'):
+        return None
+    pi_c_des = des.get('pi_c', 13.5)
+    if abs(r.get('pi_c', 0) - pi_c_des) / max(pi_c_des, 1e-6) > tol:
+        return None
+    if r.get('turb_PR', 0) < 1.5:
+        return None
+    return r
+
+
+def _seed_od_stations(prob, pt, des, fn_frac, a4_scalar):
+    """
+    Seed inter-station T/P from isentropic estimates for a cold-start OD solve.
+    Prevents Newton divergence when the previous prob state is at a very different
+    operating condition (e.g. first Brent probe after a design-only solve).
+    Mirrors combustor_turboshaft.solve_od() seeding logic.
+    """
+    _gam, _eta_c, _eta_t = 1.35, 0.83, 0.87
+    Pt_inf, Tt_inf = 14.696, 518.67
+
+    # Closing A4 raises OPR; approximate sensitivity from work-split physics
+    _opr_est = float(np.clip(des['pi_c'] * (1.0 / a4_scalar) ** 0.4, 3.0, 40.0))
+
+    # Compressor exit
+    _Tt_c3 = Tt_inf * (1.0 + (_opr_est ** ((_gam - 1.0) / _gam) - 1.0) / _eta_c)
+    _Pt_c3 = Pt_inf * _opr_est
+
+    # Turbine inlet: T4 drops at part power; always stay above T3
+    _Tt_t4 = float(np.clip(des['T4_design'] * (0.80 + 0.20 * fn_frac),
+                            _Tt_c3 + 300.0, 3000.0))
+    _Pt_t4 = _Pt_c3 * 0.95
+
+    # Turbine exit
+    _PR_t   = max(des.get('turb_PR_design', 4.0), 1.5)
+    _isTt45 = _Tt_t4 * (_PR_t ** ((1.0 - _gam) / _gam))
+    _Tt_t45 = max(_Tt_t4 - _eta_t * (_Tt_t4 - _isTt45), 500.0)
+    _Pt_t45 = max(_Pt_t4 / _PR_t, 0.5)
+
+    for _stn, _Tt_est, _Pt_est in [
+        ('comp.Fl_O',   _Tt_c3,  _Pt_c3),
+        ('burner.Fl_O', _Tt_t4,  _Pt_t4),
+        ('turb.Fl_O',   _Tt_t45, _Pt_t45),
+        ('nozz.Fl_I',   _Tt_t45, _Pt_t45),
+    ]:
+        try:
+            prob.set_val(f'{pt}.{_stn}:stat:T', max(0.85 * _Tt_est, 200.), units='K')
+            prob.set_val(f'{pt}.{_stn}:stat:P', max(_Pt_est * 0.55,  0.5), units='psi')
+            prob.set_val(f'{pt}.{_stn}:tot:T',  max(_Tt_est, 200.),        units='K')
+            prob.set_val(f'{pt}.{_stn}:tot:P',  max(_Pt_est,  0.5),        units='psi')
+        except (KeyError, AttributeError):
+            pass
+
+    try:
+        prob.set_val(f'{pt}.bld3.Fl_O:tot:T', _Tt_c3, units='K')
+        prob.set_val(f'{pt}.bld3.Fl_O:tot:P', _Pt_c3, units='psi')
+    except (KeyError, AttributeError):
+        pass
+
+    # Reset compressor internal balance temperatures — failed Brent probes can
+    # leave comp.ideal_flow.balance.T at extreme values that Newton cannot recover from.
+    _T3_ideal = Tt_inf * _opr_est ** ((_gam - 1.0) / _gam)
+    try:
+        prob.set_val(f'{pt}.comp.ideal_flow.balance.T',
+                     float(np.clip(_T3_ideal, 300., 2499.)), units='K')
+        prob.set_val(f'{pt}.comp.real_flow.balance.T',
+                     float(np.clip(_Tt_c3,    300., 2499.)), units='K')
+    except (KeyError, AttributeError):
+        pass
+
+
+def _extract_od_full(prob, pt, a4, fn_frac):
+    """extract_od_point + eta_th + FAR + dPqP, for warm-start chaining."""
+    r = extract_od_point(prob, pt)
+    r['eta_th']    = extract_eta_th(prob, pt)
+    r['a4_scalar'] = a4
+    r['fn_frac']   = fn_frac
+    r['dPqP']      = float(prob.get_val(f'{pt}.orifice.dPqP')[0])
+    r['FAR']       = float(prob.get_val(f'{pt}.balance.FAR')[0])
+    return r
+
+
+def solve_od_turbojet(prob, pt, des, fn_frac, a4, cfg, mode, warm=None, label=''):
+    """
+    Solve a single OD turbojet point with the turboshaft convergence strategy:
+      1. Physics-informed inter-station seeding on cold start (warm=None).
+      2. Outer cooling fixed-point loop — fracs fixed during Newton, updated after.
+         (cool_fracs → bld3 disconnected for OD; avoids T4↑→frac↑→FAR↑→T4↑ loop.)
+      3. is_physical() check after each outer iteration.
+      4. Second-chance retry with loose tolerances if tight Newton fails.
+    Returns result dict with 'converged' bool and 'ngv/bld_cool_frac' for chaining.
+    """
+    src = warm if warm is not None else des
+
+    prob.set_val(f'{pt}.orifice.CdA', des['CdA_liner'])
+    set_turb_area(prob, pt, a4, des['s_Wp_design'], mode)
+    prob.set_val(f'{pt}.balance.Fn_target', fn_frac * cfg['Fn_design'], units='lbf')
+    prob[f'{pt}.fc.balance.Pt'] = 14.696
+    prob[f'{pt}.fc.balance.Tt'] = 518.67
+
+    # Balance seeds from previous converged result (or design on cold start)
+    prob[f'{pt}.balance.FAR']   = float(src.get('FAR', cfg.get('FAR_guess', 0.017)))
+    prob[f'{pt}.balance.W']     = float(np.clip(
+        src.get('W', des['W']), 0.3 * des['W'], 1.5 * des['W']))
+    prob[f'{pt}.balance.Nmech'] = float(np.clip(
+        src.get('Nmech', des['Nmech']) * fn_frac**0.3 * (1.0 / a4)**0.2,
+        des['Nmech'] * 0.5, des['Nmech'] * 1.3))
+
+    if warm is None:
+        _seed_od_stations(prob, pt, des, fn_frac, a4)
+
+    _frac_ngv_cur = float(src.get('ngv_cool_frac', cfg.get('ngv_cool_frac', 0.05)))
+    _frac_bld_cur = float(src.get('bld_cool_frac', cfg.get('bld_cool_frac', 0.03)))
+
+    prob.model._get_subsystem(pt).nonlinear_solver.options['maxiter'] = NEWTON_MAXITER
+
+    # Default result with nan sentinels — overwritten by _extract_od_full on success
+    r = {k: np.nan for k in ['pi_c', 'Nmech', 'W', 'Fn', 'TSFC', 'T3', 'P3',
+                               'T4', 'T4_exit', 'comp_PR', 'comp_Wc', 'turb_PR',
+                               'turb_eff', 'turb_Wp', 'eta_th', 'dPqP', 'FAR']}
+    r.update(a4_scalar=a4, fn_frac=fn_frac, converged=False)
+    converged = False
+    for _outer in range(3):
+        prob.set_val(f'{pt}.bld3.ngv_cool:frac_W', _frac_ngv_cur)
+        prob.set_val(f'{pt}.bld3.bld_cool:frac_W', _frac_bld_cur)
+        try:
+            prob.run_model()
+            r = _extract_od_full(prob, pt, a4, fn_frac)
+            converged = is_physical_turbojet(r)
+            if not converged:
+                print(f'  {label}  [outer {_outer}] unphysical '
+                      f'(OPR={r.get("pi_c", 0):.2f} '
+                      f'Nm={r.get("Nmech", 0):.0f} '
+                      f'tPR={r.get("turb_PR", 0):.2f})')
+                break
+        except Exception as e:
+            print(f'  {label}  [outer {_outer}] exception — '
+                  f'{type(e).__name__}: {str(e)[:60]}')
+            break
+
+        _frac_ngv_new = float(prob.get_val(f'{pt}.cool_fracs.frac_ngv')[0])
+        _frac_bld_new = float(prob.get_val(f'{pt}.cool_fracs.frac_bld')[0])
+        _delta = abs(_frac_ngv_new - _frac_ngv_cur) + abs(_frac_bld_new - _frac_bld_cur)
+        _frac_ngv_cur = 0.5 * _frac_ngv_new + 0.5 * _frac_ngv_cur
+        _frac_bld_cur = 0.5 * _frac_bld_new + 0.5 * _frac_bld_cur
+        if _delta < 2e-4:
+            break
+
+    # Second-chance retry with loose tolerances
+    if not converged and '[retry' not in label:
+        _subsys = prob.model._get_subsystem(pt)
+        _orig = (_subsys.nonlinear_solver.options['atol'],
+                 _subsys.nonlinear_solver.options['rtol'],
+                 _subsys.nonlinear_solver.options['maxiter'])
+        _subsys.nonlinear_solver.options['atol']    = max(NEWTON_ATOL * 10, 1e-4)
+        _subsys.nonlinear_solver.options['rtol']    = max(NEWTON_RTOL * 10, 1e-4)
+        _subsys.nonlinear_solver.options['maxiter'] = NEWTON_MAXITER + 20
+        prob[f'{pt}.balance.FAR']   = float(src.get('FAR', cfg.get('FAR_guess', 0.017)))
+        prob[f'{pt}.balance.W']     = float(des['W'] * fn_frac)
+        prob[f'{pt}.balance.Nmech'] = des['Nmech'] * fn_frac**0.5 * (1.0 / a4)**0.3
+        prob.set_val(f'{pt}.bld3.ngv_cool:frac_W', _frac_ngv_cur)
+        prob.set_val(f'{pt}.bld3.bld_cool:frac_W', _frac_bld_cur)
+        try:
+            prob.run_model()
+            r2 = _extract_od_full(prob, pt, a4, fn_frac)
+            if is_physical_turbojet(r2):
+                r, converged = r2, True
+                print(f'  {label}  [retry] recovered with loose tolerances')
+        except Exception:
+            pass
+        _subsys.nonlinear_solver.options['atol']    = _orig[0]
+        _subsys.nonlinear_solver.options['rtol']    = _orig[1]
+        _subsys.nonlinear_solver.options['maxiter'] = _orig[2]
+
+    if converged:
+        r['ngv_cool_frac'] = float(prob.get_val(f'{pt}.cool_fracs.frac_ngv')[0])
+        r['bld_cool_frac'] = float(prob.get_val(f'{pt}.cool_fracs.frac_bld')[0])
+    r['converged'] = converged
+    return r
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -698,11 +911,14 @@ def run_study1(cfg, mode):
 
     print('\n── A4 sweep ──')
     for pt in mp.a4_pts:
-        prob.model._get_subsystem(pt).nonlinear_solver.options['maxiter'] = 15
+        prob.model._get_subsystem(pt).nonlinear_solver.options['maxiter'] = NEWTON_MAXITER
 
     for pt, a4 in zip(mp.a4_pts, mp.a4_scalars):
         set_turb_area(prob, pt, a4, design_results['s_Wp_design'], mode)
         prob[pt + '.balance.Nmech'] = design_results['Nmech'] * (1.0/a4)**0.3
+        # cool_fracs disconnected for OD — seed fracs externally
+        prob.set_val(pt + '.bld3.ngv_cool:frac_W', cfg.get('ngv_cool_frac', 0.05))
+        prob.set_val(pt + '.bld3.bld_cool:frac_W', cfg.get('bld_cool_frac', 0.03))
 
     t1 = time.time()
     prob.run_model()
@@ -781,7 +997,7 @@ def run_study2(cfg, mode, design_results_s1):
 
     print('\n── Constant-Fn sweep ──')
     for pt in mp.od_pts:
-        prob.model._get_subsystem(pt).nonlinear_solver.options['maxiter'] = 15
+        prob.model._get_subsystem(pt).nonlinear_solver.options['maxiter'] = NEWTON_MAXITER
 
     for fi, frac in enumerate(mp.fn_fractions):
         Fn_target = frac * cfg['Fn_design']
@@ -792,6 +1008,9 @@ def run_study2(cfg, mode, design_results_s1):
             prob[pt + '.balance.Nmech'] = (design_results['Nmech']
                                            * frac**0.5 * (1.0/a4)**0.3)
             prob[pt + '.balance.FAR']   = cfg.get('FAR_guess', 0.017) * frac
+            # cool_fracs disconnected for OD — seed fracs externally
+            prob.set_val(f'{pt}.bld3.ngv_cool:frac_W', cfg.get('ngv_cool_frac', 0.05))
+            prob.set_val(f'{pt}.bld3.bld_cool:frac_W', cfg.get('bld_cool_frac', 0.03))
 
     t1 = time.time()
     prob.run_model()
@@ -871,13 +1090,22 @@ def _make_mp_single_fn(cfg):
     return MPSingleFn
 
 
-def _run_od_sweep_sequential(prob, mp, maxiter=30, pts_order=None):
+def _run_od_sweep_sequential(prob, mp, maxiter=30, pts_order=None,
+                              frac_ngv=None, frac_bld=None):
+    """Sequential single-point OD sweep. Pass frac_ngv/frac_bld to seed
+    bld3 cooling fracs externally (required when cool_fracs is disconnected for OD)."""
     pts = pts_order if pts_order is not None else mp.od_pts
     t0 = time.time()
     for i, pt in enumerate(pts):
         for other in mp.od_pts:
             prob.model._get_subsystem(other).nonlinear_solver.options['maxiter'] = 0
         prob.model._get_subsystem(pt).nonlinear_solver.options['maxiter'] = maxiter
+        if frac_ngv is not None:
+            try: prob.set_val(f'{pt}.bld3.ngv_cool:frac_W', frac_ngv)
+            except KeyError: pass
+        if frac_bld is not None:
+            try: prob.set_val(f'{pt}.bld3.bld_cool:frac_W', frac_bld)
+            except KeyError: pass
         prob.run_model()
         if i + 1 < len(pts):
             nxt = pts[i+1]
@@ -897,9 +1125,11 @@ def run_fixed_dPqP_sweep(prob, mp, design_results, fn_frac, cfg, mode):
         prob[pt + '.balance.Nmech'] = (design_results['Nmech']
                                        * fn_frac**0.5 * (1.0/a4)**0.3)
         prob[pt + '.balance.FAR']   = cfg.get('FAR_guess', 0.017) * fn_frac
-        prob.model._get_subsystem(pt).nonlinear_solver.options['maxiter'] = 15
+        prob.model._get_subsystem(pt).nonlinear_solver.options['maxiter'] = NEWTON_MAXITER
 
-    _run_od_sweep_sequential(prob, mp)
+    _run_od_sweep_sequential(prob, mp,
+                              frac_ngv=cfg.get('ngv_cool_frac', 0.05),
+                              frac_bld=cfg.get('bld_cool_frac', 0.03))
 
     results = []
     for pt, a4 in zip(mp.od_pts, mp.a4_scalars):
@@ -950,9 +1180,11 @@ def run_physics_dPqP_sweep(prob, mp, design_results, fn_frac, cfg, mode,
                                            * fn_frac**0.5 * (1.0/a4)**0.3)
             prob[pt + '.balance.FAR']   = cfg.get('FAR_guess', 0.017) * fn_frac
             prob[pt + '.balance.W']     = design_results['W'] * fn_frac
-            prob.model._get_subsystem(pt).nonlinear_solver.options['maxiter'] = 15
+            prob.model._get_subsystem(pt).nonlinear_solver.options['maxiter'] = NEWTON_MAXITER
 
-        _run_od_sweep_sequential(prob, mp, pts_order=_pts_reversed)
+        _run_od_sweep_sequential(prob, mp, pts_order=_pts_reversed,
+                                  frac_ngv=cfg.get('ngv_cool_frac', 0.05),
+                                  frac_bld=cfg.get('bld_cool_frac', 0.03))
 
         dPqP_new, max_change = {}, 0.0
         for pt, a4 in zip(mp.od_pts, mp.a4_scalars):
@@ -978,7 +1210,9 @@ def run_physics_dPqP_sweep(prob, mp, design_results, fn_frac, cfg, mode,
     print('\n  Final cleanup pass...')
     for pt in mp.od_pts:
         prob.set_val(f'{pt}.burner.dPqP', dPqP_cur[pt])
-    _run_od_sweep_sequential(prob, mp, maxiter=20, pts_order=_pts_reversed)
+    _run_od_sweep_sequential(prob, mp, maxiter=20, pts_order=_pts_reversed,
+                              frac_ngv=cfg.get('ngv_cool_frac', 0.05),
+                              frac_bld=cfg.get('bld_cool_frac', 0.03))
 
     results = []
     for pt, a4 in zip(mp.od_pts, mp.a4_scalars):
@@ -1410,77 +1644,54 @@ if __name__ == '__main__':
     print(f" VGT A4 bounds: [{A4_BOUNDS[0]:.2f}, {A4_BOUNDS[1]:.2f}]  (Brent per Fn level)")
     print("=" * 65)
 
-    # ── Helper: single OD solve at a fixed A4 ────────────────────────────────
-    def _run_single_od(prob, mp, des, fn_frac, cfg, mode, a4=1.0):
+    # ── Helper: single OD solve at a fixed A4 (turboshaft-style convergence) ──
+    def _run_single_od(prob, mp, des, fn_frac, cfg, mode, a4=1.0, warm=None):
         pt = mp.od_pts[0]
-        prob.set_val(f'{pt}.orifice.CdA', des['CdA_liner'])
-        set_turb_area(prob, pt, a4, des['s_Wp_design'], mode)
-        prob.set_val(f'{pt}.balance.Fn_target',
-                     fn_frac * cfg['Fn_design'], units='lbf')
-        prob[pt + '.balance.W']     = des['W'] * fn_frac
-        prob[pt + '.balance.Nmech'] = (des['Nmech']
-                                       * fn_frac**0.5 * (1.0/a4)**0.3)
-        prob[pt + '.balance.FAR']   = cfg.get('FAR_guess', 0.017) * fn_frac
-        prob[pt + '.fc.balance.Pt'] = 14.696
-        prob[pt + '.fc.balance.Tt'] = 518.67
-        prob.model._get_subsystem(pt).nonlinear_solver.options['maxiter'] = 50
-        prob.run_model()
-        r          = extract_od_point(prob, pt)
-        r['eta_th']    = extract_eta_th(prob, pt)
-        r['a4_scalar'] = a4
-        r['dPqP']      = float(prob.get_val(f'{pt}.orifice.dPqP')[0])
-        r['fn_frac']   = fn_frac
+        r  = solve_od_turbojet(prob, pt, des, fn_frac, a4, cfg, mode,
+                               warm=warm,
+                               label=f'fixed Fn={fn_frac*100:.0f}% a4={a4:.3f}')
         return r
 
-    # ── Helper: Brent-optimal A4 with endogenous dP/P ────────────────────────
-    def _run_opt_a4(prob, mp, des, fn_frac, cfg, mode, a4_bounds=A4_BOUNDS):
-        pt        = mp.od_pts[0]
-        Fn_target = fn_frac * cfg['Fn_design']
-        prob.set_val(f'{pt}.orifice.CdA', des['CdA_liner'])
+    # ── Helper: Brent-optimal A4 with endogenous dP/P (turboshaft-style) ─────
+    def _run_opt_a4(prob, mp, des, fn_frac, cfg, mode,
+                    a4_bounds=A4_BOUNDS, warm=None):
+        pt         = mp.od_pts[0]
+        Fn_target  = fn_frac * cfg['Fn_design']
+        T4_limit_R = cfg['T4_design']
 
-        T4_limit_R = cfg['T4_design']   # hard redline — never exceed design T4
+        # Pre-solve at design A4 so prob state is in the correct thermodynamic
+        # regime for this Fn level before Brent begins probing.
+        _ref = solve_od_turbojet(prob, pt, des, fn_frac, 1.0, cfg, mode,
+                                 warm=warm,
+                                 label=f'brent a4=1.0000 [ref] Fn={fn_frac*100:.0f}%')
+        _state = [_ref if _ref.get('converged') else (warm if warm is not None else des)]
 
         def _eval(a4):
-            set_turb_area(prob, pt, a4, des['s_Wp_design'], mode)
-            prob.set_val(f'{pt}.balance.Fn_target', Fn_target, units='lbf')
-            prob[pt + '.balance.W']     = des['W'] * fn_frac
-            prob[pt + '.balance.Nmech'] = (des['Nmech']
-                                           * fn_frac**0.5 * (1.0/a4)**0.3)
-            prob[pt + '.balance.FAR']   = cfg.get('FAR_guess', 0.017) * fn_frac
-            prob[pt + '.fc.balance.Pt'] = 14.696
-            prob[pt + '.fc.balance.Tt'] = 518.67
-            prob.model._get_subsystem(pt).nonlinear_solver.options['maxiter'] = 25
-            prob.run_model()
-            T4_R = float(prob.get_val(f'{pt}.burner.Fl_O:tot:T', units='degR')[0])
-            if T4_R > T4_limit_R:
-                return -99.0   # T4 redline violated — steer Brent away
-            eta = extract_eta_th(prob, pt)
-            return eta if np.isfinite(eta) else -99.0
+            r = solve_od_turbojet(prob, pt, des, fn_frac, a4, cfg, mode,
+                                  warm=_state[0],
+                                  label=f'brent a4={a4:.4f} Fn={fn_frac*100:.0f}%')
+            if r.get('converged'):
+                _state[0] = r   # chain warm-start through Brent probes
+            T4_R = r.get('T4', 0.0)
+            if not r.get('converged') or T4_R > T4_limit_R:
+                return np.inf
+            eta = r.get('eta_th', np.nan)
+            return -eta if np.isfinite(eta) else np.inf
 
-        res    = minimize_scalar(lambda a4: -_eval(a4),
-                                 bounds=a4_bounds, method='bounded',
+        res    = minimize_scalar(_eval, bounds=a4_bounds, method='bounded',
                                  options={'xatol': 1e-3})
         a4_opt = float(res.x)
 
-        # Final cleanup solve at a4_opt with tighter maxiter
-        set_turb_area(prob, pt, a4_opt, des['s_Wp_design'], mode)
-        prob.set_val(f'{pt}.balance.Fn_target', Fn_target, units='lbf')
-        prob[pt + '.balance.Nmech'] = (des['Nmech']
-                                       * fn_frac**0.5 * (1.0/a4_opt)**0.3)
-        prob[pt + '.balance.FAR']   = cfg.get('FAR_guess', 0.017) * fn_frac
-        prob.model._get_subsystem(pt).nonlinear_solver.options['maxiter'] = 50
-        prob.run_model()
-
-        r          = extract_od_point(prob, pt)
-        r['eta_th']    = extract_eta_th(prob, pt)
-        r['a4_scalar'] = a4_opt
-        r['dPqP']      = float(prob.get_val(f'{pt}.orifice.dPqP')[0])
-        r['fn_frac']   = fn_frac
+        # Brent's last internal evaluation is NOT necessarily at res.x.
+        # Re-solve at a4_opt for a clean state and accurate result dict.
+        _final = solve_od_turbojet(prob, pt, des, fn_frac, a4_opt, cfg, mode,
+                                   warm=_state[0],
+                                   label=f'brent a4={a4_opt:.4f} [final] Fn={fn_frac*100:.0f}%')
         print(f"    Fn={fn_frac*100:.0f}%  a4*={a4_opt:.4f}"
-              f"  η_th={r['eta_th']*100:.4f}%"
-              f"  T4={r['T4']*RANKINE_TO_K:.1f}K"
-              f"  dP/P={r['dPqP']*100:.2f}%")
-        return r
+              f"  η_th={_final.get('eta_th', float('nan'))*100:.4f}%"
+              f"  T4={_final.get('T4', float('nan'))*RANKINE_TO_K:.1f}K"
+              f"  dP/P={_final.get('dPqP', float('nan'))*100:.2f}%")
+        return _final
 
     # ── Helper: blade metal temperature and Gauntner cooling ─────────────────
     def _add_thermal(r, bld_frac):
@@ -1537,6 +1748,9 @@ if __name__ == '__main__':
 
         des_cb = extract_design(prob_cb)
 
+        # Freeze DESIGN — all subsequent run_model() calls only solve the OD point
+        prob_cb.model._get_subsystem('DESIGN').nonlinear_solver.options['maxiter'] = 0
+
         # Converged cooling fracs from CoolingCalcs (dynamic, in-solver)
         cfg['ngv_cool_frac'] = float(prob_cb.get_val('DESIGN.cool_fracs.frac_ngv')[0])
         cfg['bld_cool_frac'] = float(prob_cb.get_val('DESIGN.cool_fracs.frac_bld')[0])
@@ -1565,19 +1779,27 @@ if __name__ == '__main__':
         )
         print(f"  CdA = {des_cb['CdA_liner']*1e4:.4f} cm²")
 
-        # ── Per-Fn solves ─────────────────────────────────────────────────
+        # ── Per-Fn solves (high → low for warm-start chaining) ───────────────
+        # Sweeping from 100% down to 50% lets each solve warm-start from a
+        # nearby converged state — the same strategy as combustor_turboshaft.py.
         results_by_fn = {}
-        print(f"\n  {'Fn%':>4}  solving...")
-        for fn_frac in FN_FRACS:
+        print(f"\n  {'Fn%':>4}  solving (high→low)...")
+        _prev_warm = None
+        for fn_frac in sorted(FN_FRACS, reverse=True):
             if label == 'fixed':
-                r = _run_single_od(prob_cb, mp_cb, des_cb, fn_frac, cfg, mode)
+                r = _run_single_od(prob_cb, mp_cb, des_cb, fn_frac, cfg, mode,
+                                   warm=_prev_warm)
                 print(f"    Fn={fn_frac*100:.0f}%  A4=1.00"
-                      f"  η_th={r['eta_th']*100:.4f}%"
-                      f"  T4={r['T4']*RANKINE_TO_K:.1f}K"
-                      f"  dP/P={r['dPqP']*100:.2f}%")
+                      f"  {'OK' if r.get('converged') else 'FAIL'}"
+                      f"  η_th={r.get('eta_th', float('nan'))*100:.4f}%"
+                      f"  T4={r.get('T4', float('nan'))*RANKINE_TO_K:.1f}K"
+                      f"  dP/P={r.get('dPqP', float('nan'))*100:.2f}%")
             else:
-                r = _run_opt_a4(prob_cb, mp_cb, des_cb, fn_frac, cfg, mode)
-            _add_thermal(r, cfg['bld_cool_frac'])
+                r = _run_opt_a4(prob_cb, mp_cb, des_cb, fn_frac, cfg, mode,
+                                warm=_prev_warm)
+            if r.get('converged') and all(k in r for k in ['T4', 'T4_exit', 'T3']):
+                _add_thermal(r, cfg['bld_cool_frac'])
+            _prev_warm = _safe_warm_tj(r, des_cb)
             results_by_fn[fn_frac] = r
 
         all_results[label] = {
@@ -1599,17 +1821,21 @@ if __name__ == '__main__':
     #  BUILD PLOT ARRAYS
     # ════════════════════════════════════════════════════════════════
     fn_pct   = np.array(FN_FRACS) * 100
-    a4_opt   = np.array([all_results['vgt']['by_fn'][f]['a4_scalar'] for f in FN_FRACS])
 
-    eta_fix  = np.array([all_results['fixed']['by_fn'][f]['eta_th']    for f in FN_FRACS]) * 100
-    T4_fix   = np.array([all_results['fixed']['by_fn'][f]['T4']        for f in FN_FRACS]) * RANKINE_TO_K
-    Tm_fix   = np.array([all_results['fixed']['by_fn'][f]['T_metal']   for f in FN_FRACS])
-    dP_fix   = np.array([all_results['fixed']['by_fn'][f]['dPqP']      for f in FN_FRACS]) * 100
+    def _get(label, key, frac, scale=1.0):
+        return all_results[label]['by_fn'][frac].get(key, np.nan) * scale
 
-    eta_vgt  = np.array([all_results['vgt']['by_fn'][f]['eta_th']      for f in FN_FRACS]) * 100
-    T4_vgt   = np.array([all_results['vgt']['by_fn'][f]['T4']          for f in FN_FRACS]) * RANKINE_TO_K
-    Tm_vgt   = np.array([all_results['vgt']['by_fn'][f]['T_metal']     for f in FN_FRACS])
-    dP_vgt   = np.array([all_results['vgt']['by_fn'][f]['dPqP']        for f in FN_FRACS]) * 100
+    a4_opt   = np.array([_get('vgt',   'a4_scalar', f)         for f in FN_FRACS])
+
+    eta_fix  = np.array([_get('fixed', 'eta_th',    f, 100.)   for f in FN_FRACS])
+    T4_fix   = np.array([_get('fixed', 'T4',        f, RANKINE_TO_K) for f in FN_FRACS])
+    Tm_fix   = np.array([_get('fixed', 'T_metal',   f)         for f in FN_FRACS])
+    dP_fix   = np.array([_get('fixed', 'dPqP',      f, 100.)   for f in FN_FRACS])
+
+    eta_vgt  = np.array([_get('vgt',   'eta_th',    f, 100.)   for f in FN_FRACS])
+    T4_vgt   = np.array([_get('vgt',   'T4',        f, RANKINE_TO_K) for f in FN_FRACS])
+    Tm_vgt   = np.array([_get('vgt',   'T_metal',   f)         for f in FN_FRACS])
+    dP_vgt   = np.array([_get('vgt',   'dPqP',      f, 100.)   for f in FN_FRACS])
 
     d_eta    = eta_vgt - eta_fix       # positive = VGT better
     d_Tm     = Tm_vgt  - Tm_fix        # negative = VGT blade cooler

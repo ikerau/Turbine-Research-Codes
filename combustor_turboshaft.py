@@ -346,8 +346,8 @@ def _make_turboshaft(cfg):
                                 'ngv_calcs', 'bld_calcs', 'cool_fracs', 'balance'])
 
             newton = self.nonlinear_solver = om.NewtonSolver()
-            newton.options['atol']                        = 1e-6
-            newton.options['rtol']                        = 1e-6
+            newton.options['atol']                        = 1e-8
+            newton.options['rtol']                        = 1e-8
             newton.options['iprint']                      = 2
             newton.options['maxiter']                     = 30 if design else 50
             newton.options['solve_subsystems']            = True
@@ -549,10 +549,14 @@ def extract_od(prob):
 #  OD SOLVER
 # ══════════════════════════════════════════════════════════════════════════════
 
-def solve_od(prob, des, turb_s_Wp, pt_s_Wp, pwr_hp, warm=None, label=''):
+def solve_od(prob, des, turb_s_Wp, pt_s_Wp, pwr_hp, warm=None, label='',
+             atol=1e-6, rtol=1e-6, maxiter=30):
     """
     Solve SWEEP at given turbine area scalars and power target.
     Returns result dict with 'converged' bool.
+
+    atol, rtol  — Newton absolute/relative residual tolerances (default 1e-6).
+    maxiter     — maximum Newton iterations per outer cooling loop (default 30).
     """
     src   = warm if warm is not None else des
     Pt, Tt = _std_atm(DESIGN_ALT)
@@ -593,12 +597,18 @@ def solve_od(prob, des, turb_s_Wp, pt_s_Wp, pwr_hp, warm=None, label=''):
     # overwriting it with design-point temperatures would break convergence.
     if src is des:
         _gam, _eta = 1.33, 0.87
-        _Tt_in  = Tt
-        _Pt_in  = Pt
-        _Tt_c3  = _Tt_in * des['OPR'] ** ((_gam - 1) / (_gam * _eta))
-        _Pt_c3  = _Pt_in * des['OPR']
-        # T4 must always exceed T3; T4 is a balance output at part power
-        _Tt_t4  = max(des['T4'] * RANKINE_TO_K, _Tt_c3 + 300.0)
+        # _std_atm returns Rankine; convert to Kelvin here since all stations are
+        # seeded with units='K'.  Scale OPR and T4 with power fraction so the
+        # cold-start seed is near the actual operating point at any power level
+        # (e.g. 60% power → T4_seed ≈ 1107 K instead of design 1317 K).
+        _Tt_in_K   = Tt * RANKINE_TO_K          # 518.67 °R → 288.15 K at SLS
+        _Pt_in     = Pt                          # psi
+        _pwr_ratio = float(np.clip(pwr_hp / max(des.get('SHP', pwr_hp), 1e-9), 0.3, 1.2))
+        _OPR_seed  = des['OPR'] * _pwr_ratio
+        _Tt_c3  = _Tt_in_K * _OPR_seed ** ((_gam - 1) / (_gam * _eta))
+        _Pt_c3  = _Pt_in * _OPR_seed
+        _Tt_t4  = max(des['T4'] * RANKINE_TO_K * (0.60 + 0.40 * _pwr_ratio),
+                      _Tt_c3 + 100.0)
         _Pt_t4  = _Pt_c3 * 0.97
         _isTt45 = _Tt_t4  * (_turb_PR_seed ** ((1 - _gam) / _gam))
         _Tt_t45 = max(_Tt_t4 - _eta * (_Tt_t4 - _isTt45), 300.)
@@ -632,7 +642,7 @@ def solve_od(prob, des, turb_s_Wp, pt_s_Wp, pwr_hp, warm=None, label=''):
         # Reset compressor internal temperature balances.
         # Failed Brent probes can leave comp.ideal_flow.balance.T at -2.59e8,
         # which Newton cannot recover from even with good station-T seeds above.
-        _T3_ideal = _Tt_in * des['OPR'] ** ((_gam - 1) / _gam)
+        _T3_ideal = _Tt_in_K * des['OPR'] ** ((_gam - 1) / _gam)
         try:
             prob.set_val('SWEEP.comp.ideal_flow.balance.T',
                          float(np.clip(_T3_ideal, 300., 2499.)), units='K')
@@ -649,7 +659,10 @@ def solve_od(prob, des, turb_s_Wp, pt_s_Wp, pwr_hp, warm=None, label=''):
     _frac_ngv_cur = src.get('ngv_cool_frac', des.get('ngv_cool_frac', 0.05))
     _frac_bld_cur = src.get('bld_cool_frac', des.get('bld_cool_frac', 0.03))
 
-    prob.model._get_subsystem('SWEEP').nonlinear_solver.options['maxiter'] = 30
+    _sweep_nl = prob.model._get_subsystem('SWEEP').nonlinear_solver
+    _sweep_nl.options['atol']    = atol
+    _sweep_nl.options['rtol']    = rtol
+    _sweep_nl.options['maxiter'] = maxiter
 
     r, converged = nan_result(), False
     for _outer in range(3):
@@ -679,15 +692,15 @@ def solve_od(prob, des, turb_s_Wp, pt_s_Wp, pwr_hp, warm=None, label=''):
         if _delta < 2e-4:
             break  # fracs converged — no further outer iterations needed
 
-    # Second-chance retry with loose tolerances
+    # Second-chance retry with loosened tolerances (10× relaxation from caller's tol)
     if not converged and '[retry' not in label:
         _subsys = prob.model._get_subsystem('SWEEP')
         _orig = (_subsys.nonlinear_solver.options['atol'],
                  _subsys.nonlinear_solver.options['rtol'],
                  _subsys.nonlinear_solver.options['maxiter'])
-        _subsys.nonlinear_solver.options['atol']    = 1e-4
-        _subsys.nonlinear_solver.options['rtol']    = 1e-4
-        _subsys.nonlinear_solver.options['maxiter'] = 50
+        _subsys.nonlinear_solver.options['atol']    = max(atol * 10, 1e-4)
+        _subsys.nonlinear_solver.options['rtol']    = max(rtol * 10, 1e-4)
+        _subsys.nonlinear_solver.options['maxiter'] = maxiter + 20
         prob['SWEEP.balance.FAR']      = warm['FAR']      if warm else des['FAR']
         prob['SWEEP.balance.W']        = warm['W']        if warm else des['W']
         prob['SWEEP.balance.HP_Nmech'] = warm['HP_Nmech'] if warm else des['HP_Nmech']

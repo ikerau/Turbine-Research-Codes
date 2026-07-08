@@ -21,7 +21,7 @@ from scipy.optimize import brentq
 from scipy.interpolate import interp1d
 import cantera as ct
 
-from off_design import extract_throat, rotate_stator, build_performance_curve_moffitt
+from off_design_v2 import extract_throat, rotate_stator, build_performance_curve_moffitt
 from units import Q_
 
 # ── Annulus geometry (TN D-4389, 30-inch tip diameter) ────────────────────────
@@ -111,7 +111,7 @@ raw_rotor = np.array([
 Cd = 1.00
 # ── Blade parameters (TN D-4389, mean section) ────────────────────────────────
 phi_s  = 41.03   # stator stagger [deg]
-phi_r  = 22.87   # rotor  stagger [deg]
+phi_r  = 22.87   # rotor  stagger [deg]s
 
 # Blade counts derived from Table I solidity at mean radius (σ = c / pitch_mean).
 # TN D-4389 Table I: stator σ = 1.385, rotor σ = 1.71; chord in inches.

@@ -58,12 +58,12 @@ def turbine_power(mdot_kg, Tt4_K, OPR, comp_eff, gamma_c=1.4, gamma_t=1.33,
 
 # From pyCycle DESIGN solve (OPR=13.5, T4=2370°R)
 # From pyCycle DESIGN solve (OPR=13.5, T4=2370°R)
-Tt4_K   = 1577.65          # K  = 1316.7 K
-Pt4_Pa  = 2325.15*1000
-mdot_kg = 53.935
-pwr_W   = turbine_power(mdot_kg = 52.84, Tt4_K = Tt4_K, OPR = 10.672, comp_eff = 0.867, gamma_c=1.4, gamma_t=1.33,
+Tt4_K   = 1316.7          # K  = 1316.7 K
+Pt4_Pa  = 13.5*101325
+mdot_kg = 13.43087
+pwr_W   = turbine_power(mdot_kg, Tt4_K = Tt4_K, OPR = 13.5, comp_eff = 0.83, gamma_c=1.4, gamma_t=1.33,
                   R=287.05, Tt_inlet_K=288.15)
-Nmech   = 14460                    # rpm
+Nmech   = 8070                    # rpm
 
 # =============================================================================
 #  STEP 2 — WORKING FLUID SETUP

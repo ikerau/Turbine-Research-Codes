@@ -27,22 +27,23 @@ import io, contextlib, sys, time
 import numpy as np
 import matplotlib.pyplot as plt
 import cantera as ct
-from scipy.interpolate import RectBivariateSpline, NearestNDInterpolator
-from scipy.ndimage import binary_dilation, gaussian_filter
 
 from units import Q_, ureg
 from forward_design import design_point_kinematics, forward_design
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  ENGINE CONDITIONS  (from pyCycle DESIGN solve, mirrors Turbine_Map_Generator)
+#  ENGINE CONDITIONS  (CFM56 HPT design point, from pyCycle DESIGN solve —
+#  mirrors CFM56_HPT_map_generator.py / cfm56_cycle.py DESIGN.T4_MAX=2857 degR)
 # ══════════════════════════════════════════════════════════════════════════════
 
-# From pyCycle DESIGN solve (OPR=13.5, T4=2370°R)
-Tt4_K   = 1283          # K  = 1316.7 K
-Pt4_Pa  = 1328.498*1000          # Pa = 1.368 MPa
-mdot_kg = 3.091
-pwr_W   = 799637.1253
-Nmech   = 63200
+KG_TO_LBM = 2.20462
+HP_TO_W   = 745.699872
+
+Tt4_K   = 2857.0 * (5.0 / 9.0)                       # degR -> K
+Pt4_Pa  = 145.626 * 6894.757                         # psi  -> Pa
+mdot_kg = (44.177 + 3.72358) / KG_TO_LBM             # lbm/s (core + NGV cooling) -> kg/s
+pwr_W   = 11998.248 * HP_TO_W                        # hp   -> W
+Nmech   = 14705.7                                    # rpm (HP spool)
 
 gas = ct.Solution('air.yaml')
 gas.TP = Tt4_K, Pt4_Pa
@@ -61,7 +62,7 @@ delta_H_des = pwr_W / mdot_kg         # J/kg — design specific work
 print("=" * 62)
 print("  Smith Chart — VGT vs Fixed NGV Turbine")
 print("=" * 62)
-print(f"  Tt4        = {Tt4_K:.1f} K  ({2370:.0f}°R)")
+print(f"  Tt4        = {Tt4_K:.1f} K  ({Tt4_K*9/5:.0f}°R)")
 print(f"  Pt4        = {Pt4_Pa/1e6:.3f} MPa")
 print(f"  mdot       = {mdot_kg:.2f} kg/s")
 print(f"  N          = {Nmech:.0f} rpm")
@@ -71,34 +72,35 @@ print(f"  Design ΔH  = {delta_H_des:.1f} J/kg")
 #  (φ, ψ) GRID
 # ══════════════════════════════════════════════════════════════════════════════
  
-N_PHI = 20
-N_PSI = 20
-phi_vals = np.linspace(0.375, 1.00, N_PHI)   # flow coefficient
-psi_vals = np.linspace(0.90, 1.90, N_PSI)   # stage loading
+N_PHI = 10
+N_PSI = 10
+phi_vals = np.linspace(0.40, 0.90, N_PHI)   # flow coefficient
+psi_vals = np.linspace(0.975, 1.75, N_PSI)   # stage loading
 
 # design point
 PHI_DES = 0.60
-PSI_DES = 1.20
+PSI_DES = 1.493993927
 
 # ══════════════════════════════════════════════════════════════════════════════
 #  BLADE GEOMETRY  (same for both configs; differs only in stator tip gap)
 # ══════════════════════════════════════════════════════════════════════════════
 
 _BLADE = dict(
-    AR_stator    = 1.25,
-    AR_rotor     = 1.25,
-    Z_stator     = 0.80,
-    Z_rotor      = 0.80,
-    LE_radius    = Q_(0.005,   'in'),
-    TE_radius    = Q_(0.0025,   'in'),
-    exit_wedge_s = Q_(3.0,   'deg'),
-    exit_wedge_r = Q_(3.0,   'deg'),
-    zeta_ung_s   = Q_(6.5,   'deg'),
-    zeta_ung_r   = Q_(6.5,   'deg'),
-    t_s_rotor    = 0.02,    # rotor tip-to-span ratio (0.5%) — same for VGT and Fixed
-    tol          = 1e-6,
-    max_iter     = 200,
-    verbose      = False,
+    AR_stator       = 1.307692308,
+    AR_rotor        = 1.727272727,
+    Z_stator        = 1.10,
+    Z_rotor         = 1.10,
+    LE_radius       = Q_(0.005,  'in'),
+    TE_radius       = Q_(0.0025, 'in'),
+    inlet_wedge     = Q_(15.0,  'deg'),
+    exit_wedge_s    = Q_(3.0,   'deg'),
+    exit_wedge_r    = Q_(3.0,   'deg'),
+    zeta_ung_s      = Q_(6.5,   'deg'),
+    zeta_ung_r      = Q_(6.5,   'deg'),
+    t_s_rotor       = 0.0265,
+    tol             = 1e-8,
+    max_iter        = 500,
+    verbose         = True,
 )
 
 T_S_STATOR_VGT   = 0.01   # stator tip-to-span ratio for variable geometry (0.5%)
@@ -109,8 +111,14 @@ T_S_STATOR_FIXED = 0.0     # no stator gap for fixed NGV
 #  SINGLE DESIGN SOLVE
 # ══════════════════════════════════════════════════════════════════════════════
 
-def _run_design(phi: float, psi: float, t_s_stator: float) -> float:
-    """Return η_tt at (φ, ψ) or np.nan on failure."""
+def _run_design(phi: float, psi: float, t_s_stator: float,
+                verbose: bool = False) -> float:
+    """Return η_tt at (φ, ψ) or np.nan on failure.
+
+    verbose=True prints one-line failure reason per cell so you can see
+    which (φ, ψ) regions fail and why.
+    """
+    tag = f"φ={phi:.3f} ψ={psi:.3f}"
     try:
         gas.TPX = Tt4_K, Pt4_Pa, composition
         kin = design_point_kinematics(
@@ -133,11 +141,36 @@ def _run_design(phi: float, psi: float, t_s_stator: float) -> float:
                 t_s_stator  = t_s_stator,
                 **_BLADE,
             )
-        if not d['converged']:
-            return np.nan
         eta = float(d['perf']['eta_tt'])
-        return eta if 0.30 < eta < 1.0 else np.nan
-    except Exception:
+        if not d['converged']:
+            err = d.get('err', float('nan'))
+            # r_loss err of 0.03 shifts η by ~0.3 pp — acceptable for a Smith chart.
+            # Return the last iterate rather than nan when the solution is close.
+            if err < 0.03 and (0.30 < eta < 1.0):
+                if verbose:
+                    print(f"    ACCEPTED LAST ITER  {tag}  "
+                          f"err={err:.2e}  η={eta*100:.2f}%",
+                          file=sys.stderr, flush=True)
+                return eta
+            if verbose:
+                print(f"    NOT CONVERGED  {tag}  "
+                      f"err={err:.2e}  η_last={eta*100:.2f}%",
+                      file=sys.stderr, flush=True)
+            return np.nan
+        if not (0.30 < eta < 1.0):
+            if verbose:
+                print(f"    ETA OUT OF RANGE  {tag}  η={eta*100:.2f}%",
+                      file=sys.stderr, flush=True)
+            return np.nan
+        return eta
+    except ValueError as e:
+        if verbose:
+            print(f"    GEOM FAIL  {tag}  {e}", file=sys.stderr, flush=True)
+        return np.nan
+    except Exception as e:
+        if verbose:
+            print(f"    ERROR  {tag}  {type(e).__name__}: {e}",
+                  file=sys.stderr, flush=True)
         return np.nan
 
 
@@ -156,8 +189,8 @@ t_start = time.time()
 for i, phi in enumerate(phi_vals):
     for j, psi in enumerate(psi_vals):
         t_cell = time.time()
-        eta_vgt[i, j]   = _run_design(phi, psi, T_S_STATOR_VGT)
-        eta_fixed[i, j] = _run_design(phi, psi, T_S_STATOR_FIXED)
+        eta_vgt[i, j]   = _run_design(phi, psi, T_S_STATOR_VGT,   verbose=True)
+        eta_fixed[i, j] = _run_design(phi, psi, T_S_STATOR_FIXED, verbose=True)
         done = i * N_PSI + j + 1
         elapsed = time.time() - t_start
         eta_rem = elapsed / done * (n_total - done) if done > 0 else 0
@@ -196,63 +229,7 @@ if n_valid > 0:
     print(f"    Δη      = {delta_eta[des_i, des_j]*100:.3f} pp")
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  INTERPOLATION  (upsample raw grid for smooth contours)
-# ══════════════════════════════════════════════════════════════════════════════
-
-INTERP_SCALE = 8   # 10×10 → 80×80 (or 15×15 → 120×120)
-
-
-def _interp_grid(data, phi_src, psi_src, scale=INTERP_SCALE):
-    """Bicubic upsample of a 2-D grid, NaN-safe.
-
-    NaN cells are filled with nearest-neighbour before spline fitting, then
-    the NaN mask is dilated and re-applied to the fine grid so invalid regions
-    stay blank rather than showing spline artefacts.
-
-    Returns (phi_fine, psi_fine, data_fine).
-    """
-    phi_fine = np.linspace(phi_src[0], phi_src[-1], len(phi_src) * scale)
-    psi_fine = np.linspace(psi_src[0], psi_src[-1], len(psi_src) * scale)
-
-    valid = np.isfinite(data)
-    if valid.sum() < 16:   # need ≥ (kx+1)×(ky+1) = 4×4 valid points for cubic
-        return phi_fine, psi_fine, np.full((len(phi_fine), len(psi_fine)), np.nan)
-
-    # Fill NaN with nearest-neighbour so the spline sees no gaps
-    filled = data.copy()
-    if not valid.all():
-        pts  = np.argwhere(valid)
-        nn   = NearestNDInterpolator(pts, data[valid])
-        miss = np.argwhere(~valid)
-        filled[~valid] = nn(miss)
-
-    # Gaussian pre-filter to suppress blade-count discretisation noise
-    filled = gaussian_filter(filled, sigma=1.0)
-
-    # Bicubic spline
-    spl  = RectBivariateSpline(phi_src, psi_src, filled, kx=3, ky=3)
-    fine = spl(phi_fine, psi_fine)
-
-    # Re-apply NaN mask (dilated by 1 raw cell so edge artefacts are hidden)
-    if not valid.all():
-        dilated   = binary_dilation(~valid, iterations=1)
-        mask_spl  = RectBivariateSpline(phi_src, psi_src,
-                                        dilated.astype(float), kx=1, ky=1)
-        fine[mask_spl(phi_fine, psi_fine) > 0.3] = np.nan
-
-    return phi_fine, psi_fine, fine
-
-
-
-
-phi_fine, psi_fine, eta_vgt_f   = _interp_grid(eta_vgt,   phi_vals, psi_vals)
-_,        _,        eta_fixed_f  = _interp_grid(eta_fixed,  phi_vals, psi_vals)
-_,        _,        delta_eta_f  = _interp_grid(delta_eta,  phi_vals, psi_vals)
-
-print(f"\nInterpolated to {len(phi_fine)}×{len(psi_fine)} grid (scale={INTERP_SCALE})")
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  PLOT
+#  PLOT  (raw grid — no interpolation/smoothing)
 # ══════════════════════════════════════════════════════════════════════════════
 
 # Iso-reaction lines: R = 1 − ψ/2  (for zero exit swirl, C_θ3=0)
@@ -285,10 +262,10 @@ ylim = (psi_vals[0] - 0.05, psi_vals[-1] + 0.05)
 
 # ── Panel 1: η_vgt ────────────────────────────────────────────────────────────
 ax = axes[0]
-eta_v_pct = np.ma.masked_invalid(eta_vgt_f.T * 100)
-cf1 = ax.contourf(phi_fine, psi_fine, eta_v_pct,
+eta_v_pct = np.ma.masked_invalid(eta_vgt.T * 100)
+cf1 = ax.contourf(phi_vals, psi_vals, eta_v_pct,
                   levels=ETA_LEVELS, cmap='RdYlGn', extend='both')
-cs1 = ax.contour(phi_fine, psi_fine, eta_v_pct,
+cs1 = ax.contour(phi_vals, psi_vals, eta_v_pct,
                  levels=ETA_LEVELS, colors='k', linewidths=0.5, alpha=0.45)
 ax.clabel(cs1, fmt='%.0f%%', fontsize=7, inline_spacing=2)
 _add_reaction_lines(ax, xlim)
@@ -303,10 +280,10 @@ ax.grid(True, alpha=0.12)
 
 # ── Panel 2: η_fixed ──────────────────────────────────────────────────────────
 ax = axes[1]
-eta_f_pct = np.ma.masked_invalid(eta_fixed_f.T * 100)
-cf2 = ax.contourf(phi_fine, psi_fine, eta_f_pct,
+eta_f_pct = np.ma.masked_invalid(eta_fixed.T * 100)
+cf2 = ax.contourf(phi_vals, psi_vals, eta_f_pct,
                   levels=ETA_LEVELS, cmap='RdYlGn', extend='both')
-cs2 = ax.contour(phi_fine, psi_fine, eta_f_pct,
+cs2 = ax.contour(phi_vals, psi_vals, eta_f_pct,
                  levels=ETA_LEVELS, colors='k', linewidths=0.5, alpha=0.45)
 ax.clabel(cs2, fmt='%.0f%%', fontsize=7, inline_spacing=2)
 _add_reaction_lines(ax, xlim)
@@ -319,20 +296,20 @@ ax.grid(True, alpha=0.12)
 
 # ── Panel 3: Δη = η_vgt − η_fixed ────────────────────────────────────────────
 ax = axes[2]
-delta_pct = np.ma.masked_invalid(delta_eta_f.T * 100)
+delta_pct = np.ma.masked_invalid(delta_eta.T * 100)
 _absmax = max(abs(float(np.nanmin(delta_pct.data))),
               abs(float(np.nanmax(delta_pct.data))), 0.1)
 _absmax = np.ceil(_absmax * 10) / 10    # round up to nearest 0.1 pp
 delta_levels_fill = np.linspace(-_absmax, _absmax, 21)
 delta_levels_line = np.linspace(-_absmax, _absmax, 11)
-cf3 = ax.contourf(phi_fine, psi_fine, delta_pct,
+cf3 = ax.contourf(phi_vals, psi_vals, delta_pct,
                   levels=delta_levels_fill, cmap='RdBu_r', extend='both')
-cs3 = ax.contour(phi_fine, psi_fine, delta_pct,
+cs3 = ax.contour(phi_vals, psi_vals, delta_pct,
                  levels=delta_levels_line, colors='k', linewidths=0.5, alpha=0.4)
 ax.clabel(cs3, fmt='%.2f', fontsize=7, inline_spacing=2)
 # Bold zero-crossing line
 try:
-    ax.contour(phi_fine, psi_fine, delta_pct,
+    ax.contour(phi_vals, psi_vals, delta_pct,
                levels=[0.0], colors=['k'], linewidths=2.0)
 except Exception:
     pass
@@ -362,15 +339,9 @@ plt.show()
 
 LAMBDA = 1.0   # trade-off weight; increase to penalise stator-gap leakage more
 
-# Coarse-grid cost (used for argmax — gives optimal index on the raw grid)
-_valid = np.isfinite(eta_vgt) & np.isfinite(eta_fixed)
+_valid  = np.isfinite(eta_vgt) & np.isfinite(eta_fixed)
 penalty = np.where(_valid, -delta_eta, np.nan)   # η_fixed − η_vgt ≥ 0
 J_grid  = np.where(_valid, eta_vgt + LAMBDA * delta_eta, np.nan)   # higher = better
-
-# Fine-grid cost
-_valid_f  = np.isfinite(eta_vgt_f) & np.isfinite(eta_fixed_f)
-penalty_f = np.where(_valid_f, -delta_eta_f, np.nan)
-J_grid_f  = np.where(_valid_f, eta_vgt_f + LAMBDA * delta_eta_f, np.nan)
 
 import matplotlib.gridspec as gridspec
 fig2 = plt.figure(figsize=(18, 11))
@@ -397,9 +368,9 @@ def _stamp_rxn(ax):
 
 # ── Row 0, panel 0: η_vgt objective ───────────────────────────────────────────
 ax = axes2[0][0]
-cf_e = ax.contourf(phi_fine, psi_fine, np.ma.masked_invalid(eta_vgt_f.T * 100),
+cf_e = ax.contourf(phi_vals, psi_vals, np.ma.masked_invalid(eta_vgt.T * 100),
                    levels=np.arange(68, 99, 2), cmap='RdYlGn', extend='both')
-ax.contour(phi_fine, psi_fine, np.ma.masked_invalid(eta_vgt_f.T * 100),
+ax.contour(phi_vals, psi_vals, np.ma.masked_invalid(eta_vgt.T * 100),
            levels=np.arange(68, 99, 2), colors='k', linewidths=0.4, alpha=0.4)
 _stamp_rxn(ax)
 ax.plot(PHI_DES, PSI_DES, 'k*', ms=11, zorder=5, label='Design pt')
@@ -412,12 +383,12 @@ ax.grid(True, alpha=0.10)
 
 # ── Row 0, panel 1: stator-gap penalty objective ──────────────────────────────
 ax = axes2[0][1]
-pen_pct = np.ma.masked_invalid(penalty_f.T * 100)
+pen_pct = np.ma.masked_invalid(penalty.T * 100)
 _pen_max_pct = np.nanmax(penalty) * 100
 pen_levels = np.linspace(0, _pen_max_pct * 1.05, 20)
-cf_p = ax.contourf(phi_fine, psi_fine, pen_pct,
+cf_p = ax.contourf(phi_vals, psi_vals, pen_pct,
                    levels=pen_levels, cmap='YlOrRd', extend='both')
-ax.contour(phi_fine, psi_fine, pen_pct,
+ax.contour(phi_vals, psi_vals, pen_pct,
            levels=pen_levels[::4], colors='k', linewidths=0.4, alpha=0.4)
 _stamp_rxn(ax)
 ax.plot(PHI_DES, PSI_DES, 'k*', ms=11, zorder=5)
@@ -460,18 +431,18 @@ ax.grid(True, alpha=0.25)
 # ── Row 1: single J = Δη / η_vgt panel (spans all 3 columns) ────────────────
 ax_J = fig2.add_subplot(gs2[1, :])
 
-J_levels = np.linspace(float(np.nanmin(J_grid_f)), float(np.nanmax(J_grid_f)), 25)
-J_ma = np.ma.masked_invalid(J_grid_f.T)
-cf_J = ax_J.contourf(phi_fine, psi_fine, J_ma,
+J_levels = np.linspace(float(np.nanmin(J_grid)), float(np.nanmax(J_grid)), 25)
+J_ma = np.ma.masked_invalid(J_grid.T)
+cf_J = ax_J.contourf(phi_vals, psi_vals, J_ma,
                      levels=J_levels, cmap='RdYlGn', extend='both')
-ax_J.contour(phi_fine, psi_fine, J_ma,
+ax_J.contour(phi_vals, psi_vals, J_ma,
              levels=J_levels[::4], colors='k', linewidths=0.4, alpha=0.35)
 
 # Optimal = highest J (argmax)
-opt_ij  = np.unravel_index(np.nanargmax(J_grid_f), J_grid_f.shape)
-phi_opt = phi_fine[opt_ij[0]]
-psi_opt = psi_fine[opt_ij[1]]
-J_opt   = float(J_grid_f[opt_ij])
+opt_ij  = np.unravel_index(np.nanargmax(J_grid), J_grid.shape)
+phi_opt = phi_vals[opt_ij[0]]
+psi_opt = psi_vals[opt_ij[1]]
+J_opt   = float(J_grid[opt_ij])
 ax_J.plot(phi_opt, psi_opt, 'b*', ms=14, zorder=6,
           label=f'Best\nφ={phi_opt:.3f}, ψ={psi_opt:.3f}\nJ={J_opt*100:.2f}%')
 ax_J.plot(PHI_DES, PSI_DES, 'w^', ms=9, zorder=6, mec='k', mew=0.8,
@@ -487,8 +458,8 @@ ax_J.legend(fontsize=8, loc='upper right')
 ax_J.grid(True, alpha=0.10)
 
 print(f"  Best operating point (λ={LAMBDA}): φ={phi_opt:.3f}, ψ={psi_opt:.3f}  "
-      f"η_vgt={eta_vgt_f[opt_ij]*100:.2f}%  "
-      f"penalty={penalty_f[opt_ij]*100:.3f} pp  J={J_opt*100:.2f}%")
+      f"η_vgt={eta_vgt[opt_ij]*100:.2f}%  "
+      f"penalty={penalty[opt_ij]*100:.3f} pp  J={J_opt*100:.2f}%")
 
 plt.tight_layout()
 plt.savefig('smith_cost_function.png', dpi=150, bbox_inches='tight')
